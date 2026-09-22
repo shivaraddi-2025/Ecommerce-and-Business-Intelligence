@@ -1,0 +1,18 @@
+column,dtype,row_count,missing_count,missing_percent,unique_count,duplicate_value_count
+Order ID,object,6040,0,0.0,6000,40
+Order Date,object,6040,0,0.0,1093,4947
+Customer ID,object,6040,0,0.0,800,5240
+Customer Name,object,6040,30,0.4967,340,5700
+Product ID,object,6040,0,0.0,5112,928
+Product Name,object,6040,0,0.0,53,5987
+Category,object,6040,0,0.0,5,6035
+Sub-Category,object,6040,0,0.0,20,6020
+Region,object,6040,0,0.0,8,6032
+State,object,6040,0,0.0,14,6026
+City,object,6040,0,0.0,29,6011
+Quantity,int64,6040,0,0.0,7,6033
+Sales,float64,6040,0,0.0,5995,45
+Profit,float64,6040,0,0.0,5981,59
+Discount,float64,6040,60,0.9934,8,6032
+Shipping Mode,object,6040,0,0.0,4,6036
+Return Status,object,6040,0,0.0,2,6038

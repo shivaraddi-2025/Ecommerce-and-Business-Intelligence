@@ -1,0 +1,25 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run Nexus dashboard",
+			"type": "shell",
+			"command": ".\\.venv\\Scripts\\python.exe -m uvicorn backend.app.main:app --reload --port 8000",
+			"isBackground": true,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "Copy ecommerce dataset",
+			"type": "shell",
+			"command": "Copy-Item",
+			"args": [
+				"C:\\Users\\shiva\\Downloads\\data analytics project\\ecommerce_sales_raw.csv",
+				".\\data\\raw\\ecommerce_sales_raw.csv",
+				"-Force"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
+}

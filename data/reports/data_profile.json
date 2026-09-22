@@ -1,0 +1,193 @@
+{
+  "input_file": "data\\raw\\ecommerce_sales_raw.csv",
+  "row_count": 6040,
+  "column_count": 17,
+  "expected_columns_match": true,
+  "missing_expected_columns": [],
+  "unexpected_columns": [],
+  "columns": [
+    "Order ID",
+    "Order Date",
+    "Customer ID",
+    "Customer Name",
+    "Product ID",
+    "Product Name",
+    "Category",
+    "Sub-Category",
+    "Region",
+    "State",
+    "City",
+    "Quantity",
+    "Sales",
+    "Profit",
+    "Discount",
+    "Shipping Mode",
+    "Return Status"
+  ],
+  "dtypes": {
+    "Order ID": "object",
+    "Order Date": "object",
+    "Customer ID": "object",
+    "Customer Name": "object",
+    "Product ID": "object",
+    "Product Name": "object",
+    "Category": "object",
+    "Sub-Category": "object",
+    "Region": "object",
+    "State": "object",
+    "City": "object",
+    "Quantity": "int64",
+    "Sales": "float64",
+    "Profit": "float64",
+    "Discount": "float64",
+    "Shipping Mode": "object",
+    "Return Status": "object"
+  },
+  "date_range": {
+    "min": "2023-01-01",
+    "max": "2025-12-31"
+  },
+  "unique_counts": {
+    "Order ID": 6000,
+    "Order Date": 1093,
+    "Customer ID": 800,
+    "Customer Name": 340,
+    "Product ID": 5112,
+    "Product Name": 53,
+    "Category": 5,
+    "Sub-Category": 20,
+    "Region": 8,
+    "State": 14,
+    "City": 29,
+    "Quantity": 7,
+    "Sales": 5995,
+    "Profit": 5981,
+    "Discount": 8,
+    "Shipping Mode": 4,
+    "Return Status": 2
+  },
+  "rules": {
+    "exact_duplicate_rows": 39,
+    "duplicate_order_ids": 40,
+    "invalid_dates": 0,
+    "nonpositive_quantity": 0,
+    "negative_sales": 0,
+    "negative_profit": 485,
+    "invalid_discount": 0,
+    "invalid_return_status": 0,
+    "missing_customer_name": 30,
+    "inconsistent_region_case": 60
+  },
+  "numeric": {
+    "Quantity": {
+      "invalid_count": 0,
+      "min": 1.0,
+      "max": 7.0,
+      "mean": 3.995364238410596,
+      "median": 4.0,
+      "iqr_outlier_count": 0
+    },
+    "Sales": {
+      "invalid_count": 0,
+      "min": 45.18,
+      "max": 419298.39,
+      "mean": 42407.704908940395,
+      "median": 13332.43,
+      "iqr_outlier_count": 677
+    },
+    "Profit": {
+      "invalid_count": 0,
+      "min": -33606.71,
+      "max": 79630.05,
+      "mean": 4679.4066208609265,
+      "median": 1649.9850000000001,
+      "iqr_outlier_count": 784
+    },
+    "Discount": {
+      "invalid_count": 60,
+      "min": 0.0,
+      "max": 0.3,
+      "mean": 0.1162458193979933,
+      "median": 0.1,
+      "iqr_outlier_count": 0
+    }
+  },
+  "categorical_value_counts": {
+    "Category": {
+      "Electronics": 1678,
+      "Clothing": 1367,
+      "Furniture": 1084,
+      "Office Supplies": 1009,
+      "Home & Kitchen": 902
+    },
+    "Sub-Category": {
+      "Mobiles": 372,
+      "Men's Wear": 368,
+      "Headphones": 345,
+      "Kids Wear": 340,
+      "Footwear": 336,
+      "Laptops": 332,
+      "Accessories": 327,
+      "Women's Wear": 323,
+      "Decor": 311,
+      "Cameras": 302,
+      "Appliances": 299,
+      "Storage": 294,
+      "Cookware": 292,
+      "Tables": 286,
+      "Stationery": 270,
+      "Bookcases": 260,
+      "Binders": 258,
+      "Chairs": 244,
+      "Paper": 243,
+      "Art Supplies": 238
+    },
+    "Region": {
+      "South": 1926,
+      "North": 1655,
+      "West": 1452,
+      "East": 947,
+      "SOUTH": 23,
+      "NORTH": 13,
+      "WEST": 13,
+      "EAST": 11
+    },
+    "Shipping Mode": {
+      "Standard Class": 3000,
+      "First Class": 1213,
+      "Second Class": 1208,
+      "Same Day": 619
+    },
+    "Return Status": {
+      "Not Returned": 5455,
+      "Returned": 585
+    }
+  },
+  "category_summary": {
+    "Electronics": {
+      "records": 1678,
+      "sales": 179696482.15,
+      "profit": 20164220.0
+    },
+    "Furniture": {
+      "records": 1084,
+      "sales": 49425772.93,
+      "profit": 3758637.74
+    },
+    "Home & Kitchen": {
+      "records": 902,
+      "sales": 13070514.38,
+      "profit": 1586462.36
+    },
+    "Clothing": {
+      "records": 1367,
+      "sales": 10135784.28,
+      "profit": 2075839.02
+    },
+    "Office Supplies": {
+      "records": 1009,
+      "sales": 3813983.91,
+      "profit": 678456.87
+    }
+  }
+}
