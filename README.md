@@ -15,14 +15,23 @@ $env:APP_SECRET = 'replace-this-for-local-development'
 .\.venv\Scripts\python.exe -m uvicorn backend.app.main:app --reload
 ```
 
-Open `http://127.0.0.1:8000`. The first sign-in registers a local Viewer account automatically. API documentation is at `/docs`.
+Open `http://127.0.0.1:8000` after starting the backend. The React dashboard is served from the built frontend bundle and the first sign-in registers a local Viewer account automatically. API documentation is at `/docs`.
+
+For frontend development from the project root:
+
+```powershell
+npm install
+npm run dev
+```
+
+The root `npm run dev` command delegates to the React app in `frontend/`. The Vite dev server runs on `http://127.0.0.1:5173` and talks to the FastAPI API on `http://127.0.0.1:8000`. To install frontend dependencies directly, use `npm --prefix frontend install`.
 
 The default project dataset is `data/raw/ecommerce_sales_raw.csv.csv` with 80,000
 orders. The API normalizes its lowercase source columns to the names used by
 the dashboard. Dataset-backed place/city values are available in the dashboard
-filter and are applied to KPI, trend, and daily sales views. Because this source does not provide cost or profit data,
-`Profit` and profit-based predictions are reported as zero rather than being
-invented from sales.
+filter and are applied to KPI, trend, and daily sales views. Because this source
+does not provide cost or profit data, profit is transparently estimated at a
+30% planning margin and marked as estimated in the data-quality response.
 
 If PowerShell has not activated the virtual environment, use the explicit
 `.venv\Scripts\python.exe` command above. Running `python -m uvicorn` with a
@@ -35,8 +44,7 @@ different system Python can fail with `ModuleNotFoundError: No module named
 
 ## Project phases
 
-The profiling artifacts in `data/reports` are the evidence baseline. Next implementation phases should add deterministic cleaning outputs, persisted feature tables, trained model artifacts with validation metrics, scheduled reports, and a production database connection. The dashboard currently uses CDN Chart.js for a zero-build local demo; production deployment should pin and bundle frontend assets.
-
+The profiling artifacts in `data/reports` are the evidence baseline. Next implementation phases should add deterministic cleaning outputs, persisted feature tables, trained model artifacts with validation metrics, scheduled reports, and a production database connection. The dashboard has been converted to a React + Vite frontend with component-based rendering and a production build pipeline; the backend still exposes the analytics API and can serve the built bundle.
 Run tests with:
 
 ```powershell

@@ -4,9 +4,12 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from sklearn.ensemble import RandomForestRegressor
 
 
 class AnalyticsEngine:
+	ESTIMATED_PROFIT_MARGIN = 0.30
+
 	def __init__(self, dataset_path: Path) -> None:
 		self.dataset_path = dataset_path
 		self.source_columns: list[str] = []
@@ -22,6 +25,31 @@ class AnalyticsEngine:
 	def _load(self) -> pd.DataFrame:
 		frame = pd.read_csv(self.dataset_path)
 		self.source_columns = frame.columns.tolist()
+		raw_date = frame.get("order_date", frame.get("Order Date"))
+		self.source_quality = {
+			"records": int(len(frame)),
+			"columns": int(len(frame.columns)),
+			"missing_values": int(frame.isna().sum().sum()),
+			"rows_with_missing": int(frame.isna().any(axis=1).sum()),
+			"duplicate_rows": int(frame.duplicated().sum()),
+			"invalid_dates": int(pd.to_datetime(raw_date, errors="coerce").isna().sum()) if raw_date is not None else int(len(frame)),
+		}
+		self.prediction_loss_rate: float | None = None
+		self.prediction_loss_basis = "Unavailable because the source has no cost, expense, or loss-status data"
+		sales_column = "net_amount" if "net_amount" in frame.columns else "Sales" if "Sales" in frame.columns else None
+		if sales_column:
+			raw_sales = pd.to_numeric(frame[sales_column], errors="coerce").fillna(0).clip(lower=0)
+			total_sales = float(raw_sales.sum())
+			profit_column = "Profit" if "Profit" in frame.columns else "profit" if "profit" in frame.columns else None
+			status_column = "order_status" if "order_status" in frame.columns else "Return Status" if "Return Status" in frame.columns else None
+			if total_sales > 0 and profit_column:
+				raw_profit = pd.to_numeric(frame[profit_column], errors="coerce").fillna(0)
+				self.prediction_loss_rate = min(max(float((-raw_profit.clip(upper=0)).sum()) / total_sales, 0), 1)
+				self.prediction_loss_basis = "Estimated from historical negative profit as a share of sales"
+			elif total_sales > 0 and status_column:
+				loss_statuses = frame[status_column].fillna("").astype(str).str.strip().str.lower().isin({"returned", "cancelled", "canceled"})
+				self.prediction_loss_rate = min(max(float(raw_sales[loss_statuses].sum()) / total_sales, 0), 1)
+				self.prediction_loss_basis = "Estimated from historical sales marked returned or cancelled"
 		if "order_status" in frame.columns:
 			self.status_counts = frame["order_status"].value_counts().astype(int).to_dict()
 		self.has_profit_data = "Profit" in frame.columns or "profit" in frame.columns
@@ -52,6 +80,7 @@ class AnalyticsEngine:
 		if missing:
 			raise ValueError(f"Dataset is missing required columns: {', '.join(missing)}")
 
+		sales = pd.to_numeric(frame["net_amount"], errors="coerce").fillna(0)
 		normalized = pd.DataFrame(
 			{
 				"Order ID": frame["order_id"],
@@ -66,8 +95,8 @@ class AnalyticsEngine:
 				"State": frame["city"],
 				"City": frame["city"],
 				"Quantity": frame["quantity"],
-				"Sales": frame["net_amount"],
-				"Profit": 0.0,
+				"Sales": sales,
+				"Profit": (sales * AnalyticsEngine.ESTIMATED_PROFIT_MARGIN).round(2),
 				"Discount": frame.get("discount_pct", 0),
 				"Shipping Mode": frame.get("payment_method", "Unknown"),
 				"Return Status": frame["order_status"].eq("Returned").map(
@@ -317,160 +346,194 @@ class AnalyticsEngine:
 		return result.sort_values("score", ascending=False).head(limit).round(2).to_dict("records")
 
 	def quality(self) -> dict[str, object]:
+		"""Return source-file quality metrics, before normalization fills or estimates values."""
+		stats = getattr(self, "source_quality", {})
+		records = int(stats.get("records", len(self.frame)))
+		columns = int(stats.get("columns", len(self.source_columns)))
+		cells = records * columns
+		completeness = 100 * (1 - stats.get("missing_values", 0) / cells) if cells else 0.0
+		uniqueness = 100 * (1 - stats.get("duplicate_rows", 0) / records) if records else 0.0
+		date_validity = 100 * (1 - stats.get("invalid_dates", 0) / records) if records else 0.0
 		return {
-			"records": int(len(self.frame)),
-			"columns": len(self.source_columns),
+			"records": records,
+			"columns": columns,
 			"source_columns": self.source_columns,
 			"status_counts": self.status_counts,
 			"has_profit_data": self.has_profit_data,
-			"missing_values": int(self.frame.isna().sum().sum()),
-			"duplicate_rows": int(self.frame.duplicated().sum()),
+			"profit_is_estimated": not self.has_profit_data,
+			"estimated_profit_margin": self.ESTIMATED_PROFIT_MARGIN if not self.has_profit_data else None,
+			"missing_values": int(stats.get("missing_values", 0)),
+			"rows_with_missing": int(stats.get("rows_with_missing", 0)),
+			"duplicate_rows": int(stats.get("duplicate_rows", 0)),
+			"invalid_dates": int(stats.get("invalid_dates", 0)),
+			"completeness": round(max(0.0, min(100.0, completeness)), 2),
+			"uniqueness": round(max(0.0, min(100.0, uniqueness)), 2),
+			"date_validity": round(max(0.0, min(100.0, date_validity)), 2),
+			"quality_score": round(max(0.0, min(100.0, (completeness + uniqueness + date_validity) / 3)), 2),
 			"negative_profit_rows": int((self.frame["Profit"] < 0).sum()),
 			"returned_orders": int(self.frame["Return Flag"].sum()),
 			"date_min": self.frame["Order Date"].min().strftime("%Y-%m-%d"),
 			"date_max": self.frame["Order Date"].max().strftime("%Y-%m-%d"),
 		}
 
-	def forecast_daily_sales(self, selected_date: str | None = None, year: str | None = None) -> dict[str, object]:
-		estimated_margin = 0.30
+	def forecast_daily_sales(
+		self,
+		selected_date: str | None = None,
+		year: str | None = None,
+		horizon: int = 1,
+		observed_sales: float | None = None,
+	) -> dict[str, object]:
+		"""Train on past daily observations and forecast the day after the selected/latest date."""
+		horizon = max(1, min(int(horizon), 30))
+		empty = {
+			"forecast_date": "", "today_sales": 0, "predicted_sales": 0,
+			"predicted_revenue": 0, "predicted_profit": 0, "predicted_loss": None, "predicted_orders": 0,
+			"confidence": 0, "forecast": [], "basis": "Insufficient daily data for an ML forecast",
+			"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
+			"loss_basis": "Unavailable because the source has no cost or expense data",
+		}
 		if self.daily_frame.empty:
-			return {
-				"forecast_date": "",
-				"today_sales": 0,
-				"predicted_sales": 0,
-				"predicted_profit": 0,
-				"predicted_loss": 0,
-				"predicted_orders": 0,
-				"confidence": 0,
-				"basis": "No daily dataset available",
-				"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-			}
+			return empty
 
 		frame = self.daily_frame.copy()
-		frame['Order Date'] = pd.to_datetime(frame['Order Date'], errors='coerce')
-		frame = frame.sort_values('Order Date').dropna(subset=['Order Date']).reset_index(drop=True)
-		if frame.empty:
-			return {
-				"forecast_date": "",
-				"today_sales": 0,
-				"predicted_sales": 0,
-				"predicted_profit": 0,
-				"predicted_loss": 0,
-				"predicted_orders": 0,
-				"confidence": 0,
-				"basis": "No daily dataset available",
-				"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-			}
-
+		frame["Order Date"] = pd.to_datetime(frame["Order Date"], errors="coerce").dt.normalize()
+		frame["sales"] = pd.to_numeric(frame["sales"], errors="coerce").fillna(0)
+		frame["orders"] = pd.to_numeric(frame.get("orders", 0), errors="coerce").fillna(0)
+		frame = frame.dropna(subset=["Order Date"]).groupby("Order Date", as_index=False).agg(
+			sales=("sales", "sum"), orders=("orders", "sum")
+		).sort_values("Order Date").set_index("Order Date")
 		if year:
 			try:
-				year_value = int(str(year))
-				frame = frame[frame['Order Date'].dt.year.eq(year_value)].copy()
-			except Exception:
+				frame = frame[frame.index.year == int(year)]
+			except (TypeError, ValueError):
 				pass
-
 		if frame.empty:
-			return {
-				"forecast_date": "",
-				"today_sales": 0,
-				"predicted_sales": 0,
-				"predicted_profit": 0,
-				"predicted_loss": 0,
-				"predicted_orders": 0,
-				"confidence": 0,
-				"basis": "No daily data for selected year",
-				"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-			}
+			return {**empty, "basis": "No daily data for selected year"}
 
-		base_date = pd.Timestamp(frame['Order Date'].iloc[-1])
+		# Fill calendar gaps so lag values always mean consecutive days.
+		frame = frame.asfreq("D", fill_value=0)
 		if selected_date:
 			try:
-				selected = pd.Timestamp(selected_date).normalize()
-				filtered = frame[frame['Order Date'] <= selected].copy()
-				if filtered.empty:
-					frame = self.daily_frame.copy()
-					frame['Order Date'] = pd.to_datetime(frame['Order Date'], errors='coerce')
-					frame = frame.sort_values('Order Date').dropna(subset=['Order Date']).reset_index(drop=True)
-					if year:
-						try:
-							year_value = int(str(year))
-							frame = frame[frame['Order Date'].dt.year.eq(year_value)].copy()
-						except Exception:
-							pass
-					if frame.empty:
-						return {
-							"forecast_date": "",
-							"today_sales": 0,
-							"predicted_sales": 0,
-							"predicted_profit": 0,
-							"predicted_loss": 0,
-							"predicted_orders": 0,
-							"confidence": 0,
-							"basis": "No daily data for selected date/year",
-							"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-						}
-					base_date = pd.Timestamp(frame['Order Date'].iloc[-1])
-				else:
-					frame = filtered
-					base_date = pd.Timestamp(selected)
-			except Exception:
-				selected = None
+				base_date = pd.Timestamp(selected_date).normalize()
+			except (TypeError, ValueError):
+				return {**empty, "basis": "Invalid date; use YYYY-MM-DD"}
+			latest_data_date = frame.index[-1]
+			if base_date < frame.index[0]:
+				return {**empty, "basis": "Selected date is outside the available daily data"}
+			if base_date > latest_data_date and observed_sales is None:
+				return {**empty, "basis": "Enter today's sales to forecast from a date after the dataset ends"}
+			if base_date not in frame.index and observed_sales is None:
+				return {**empty, "basis": "Selected date is outside the available daily data"}
+		else:
+			base_date = frame.index[-1]
+		base_pos = frame.index.get_loc(base_date) if base_date in frame.index else len(frame.index) - 1
+		if base_pos < 14:
+			return {**empty, "basis": "At least 15 days of history are needed for the ML forecast"}
 
-		if frame.empty:
-			return {
-				"forecast_date": "",
-				"today_sales": 0,
-				"predicted_sales": 0,
-				"predicted_profit": 0,
-				"predicted_loss": 0,
-				"predicted_orders": 0,
-				"confidence": 0,
-				"basis": "No daily data for selected date/year",
-				"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-			}
+		def features_at(pos: int) -> list[float]:
+			# Include sales through `pos` (today) when predicting the following date.
+			date = frame.index[pos + 1]
+			values = frame["sales"]
+			return [
+				float(values.iloc[pos - lag + 1]) for lag in (1, 2, 3, 7, 14)
+				] + [
+				float(values.iloc[pos - 6:pos + 1].mean()),
+				float(values.iloc[pos - 13:pos + 1].mean()),
+				float(date.dayofweek), float(date.month), float(date.dayofyear),
+			]
 
-		last_day = frame.tail(1).iloc[0]
-		last_sales = float(last_day.get('sales', 0) or 0)
-		last_profit = float(last_day.get('profit', 0) or 0)
-		last_orders = int(last_day.get('orders', 0) or 0)
-		last_return_rate = float(last_day.get('return_rate', 0) or 0)
+		# Each training row uses only information available on that date; its label is
+		# the following day's sales. Restrict labels to dates at/before the forecast origin.
+		train_x = [features_at(pos) for pos in range(14, base_pos)]
+		train_y = [float(frame["sales"].iloc[pos + 1]) for pos in range(14, base_pos)]
+		if len(train_x) < 10:
+			return {**empty, "basis": "At least 25 days of history are needed for the ML forecast"}
 
-		# Use a 7-day moving average as the sales and profit baseline and then apply a mild growth
-		# correction based on the latest change in the last two observed days.
-		window = min(7, len(frame))
-		last_window = frame.tail(window)
-		moving_sales = float(last_window['sales'].mean())
-		moving_profit = float(last_window['profit'].mean())
-		moving_orders = float(last_window['orders'].mean())
-
-		trend_growth = 0.0
-		if len(frame) >= 2:
-			last_two = frame.tail(2)
-			previous_sales = float(last_two.iloc[0].get('sales', 0) or 0)
-			trend_growth = (last_sales - previous_sales) / previous_sales if previous_sales else 0.0
-
-		forecast_sales = moving_sales * (1 + max(min(trend_growth, 0.08), -0.03))
-		forecast_profit = max(forecast_sales * estimated_margin, 0)
-		forecast_loss = max(-forecast_sales * estimated_margin, 0)
-		forecast_orders = max(int(round(moving_orders)), 1)
-
-		# Confidence dampens when the latest return rate is high, which matches the risk-aware
-		# dashboard language already used elsewhere in the daily report.
-		return_pressure = min(max(last_return_rate, 0), 100)
-		confidence = max(55, min(98, int(round(92 - (return_pressure * 0.5)))))
-		forecast_date = pd.Timestamp(base_date) + pd.Timedelta(days=1)
-
+		# Hold out the latest 20% of training examples in chronological order.
+		split = max(1, int(len(train_x) * 0.8))
+		validation_x, validation_y = train_x[split:], np.asarray(train_y[split:], dtype=float)
+		model = RandomForestRegressor(
+			n_estimators=300, min_samples_leaf=2, max_features=0.9,
+			random_state=42, n_jobs=1,
+		)
+		if len(validation_y):
+			model.fit(train_x[:split], train_y[:split])
+			ml_validation = model.predict(validation_x)
+			baseline_validation = np.asarray([row[5] for row in validation_x], dtype=float)
+			ml_mae = float(np.mean(np.abs(validation_y - ml_validation)))
+			baseline_mae = float(np.mean(np.abs(validation_y - baseline_validation)))
+		else:
+			ml_mae = float('inf')
+			baseline_mae = float('inf')
+		# Use the ML result only when it beats the 7-day mean on unseen dates.
+		use_ml = ml_mae <= baseline_mae
+		model.fit(train_x, train_y)
+		last_sales = float(observed_sales) if observed_sales is not None else float(frame["sales"].iloc[base_pos])
+		last_orders = float(frame["orders"].iloc[base_pos])
+		latest_historical_sales = float(frame["sales"].iloc[base_pos])
+		avg_order_value = latest_historical_sales / last_orders if last_orders else 0.0
+		avg_orders = float(frame["orders"].iloc[max(0, base_pos - 6):base_pos + 1].mean())
+		reference_history = frame["sales"].iloc[:base_pos + 1].astype(float).tolist()
+		scale_base = reference_history[-1] if reference_history[-1] > 0 else float(np.mean(reference_history[-7:]))
+		forecast_scale = last_sales / scale_base if observed_sales is not None and scale_base > 0 else 1.0
+		history_gap_days = max(0, int((base_date - frame.index[base_pos]).days - (0 if base_date == frame.index[base_pos] else 1)))
+		forecast_rows: list[dict[str, object]] = []
+		loss_rate = self.prediction_loss_rate
+		for step in range(horizon):
+			forecast_date = base_date + pd.Timedelta(days=step + 1)
+			features = [reference_history[-lag] for lag in (1, 2, 3, 7, 14)]
+			features.extend([
+				float(np.mean(reference_history[-7:])),
+				float(np.mean(reference_history[-14:])),
+				float(forecast_date.dayofweek),
+				float(forecast_date.month),
+				float(forecast_date.dayofyear),
+			])
+			ml_forecast = float(model.predict([features])[0])
+			baseline_forecast = float(np.mean(reference_history[-7:]))
+			raw_forecast = max(0.0, ml_forecast if use_ml else baseline_forecast)
+			forecast_sales = raw_forecast * forecast_scale
+			if forecast_sales <= 0:
+				forecast_orders = 0
+			elif avg_order_value > 0:
+				forecast_orders = max(1, int(round(forecast_sales / avg_order_value)))
+			else:
+				forecast_orders = max(0, int(round(avg_orders)))
+			predicted_loss = round(forecast_sales * loss_rate, 2) if loss_rate is not None else None
+			profitable_sales = max(0.0, forecast_sales - (predicted_loss or 0))
+			predicted_profit = round(profitable_sales * self.ESTIMATED_PROFIT_MARGIN, 2)
+			reference_history.append(raw_forecast)
+			forecast_rows.append({
+				"date": forecast_date.strftime("%Y-%m-%d"),
+				"revenue": round(forecast_sales, 2),
+				"predicted_sales": round(forecast_sales, 2),
+				"predicted_profit": predicted_profit,
+				"predicted_loss": predicted_loss,
+				"predicted_orders": forecast_orders,
+			})
+		forecast_date = base_date + pd.Timedelta(days=1)
+		first_forecast = forecast_rows[0]
 		return {
-			"forecast_date": forecast_date.strftime('%Y-%m-%d'),
+			"forecast_date": forecast_date.strftime("%Y-%m-%d"),
+			"latest_observed_date": base_date.strftime("%Y-%m-%d"),
 			"today_sales": round(last_sales, 2),
-			"predicted_sales": round(forecast_sales, 2),
-			"predicted_profit": round(forecast_profit, 2),
-			"predicted_loss": round(forecast_loss, 2),
-			"predicted_orders": int(forecast_orders),
-			"confidence": int(confidence),
-			"basis": "moving 7-day average with latest growth adjustment",
+			"predicted_sales": first_forecast["predicted_sales"],
+			"predicted_revenue": first_forecast["revenue"],
+			"predicted_profit": first_forecast["predicted_profit"],
+			"predicted_loss": first_forecast["predicted_loss"],
+			"predicted_orders": first_forecast["predicted_orders"],
+			"forecast": forecast_rows,
+			"history_gap_days": history_gap_days,
+			"confidence": 0,
+			"basis": "Random forest" if use_ml else "7-day average (lower validation MAE than random forest)",
+			"forecast_scale": round(forecast_scale, 8),
+			"validation_mae": round(ml_mae if use_ml else baseline_mae, 2),
+			"random_forest_validation_mae": round(ml_mae, 2),
+			"baseline_validation_mae": round(baseline_mae, 2),
+			"validation_days": int(len(validation_y)),
 			"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
-			"return_rate": round(last_return_rate, 2),
+			"loss_rate": round(loss_rate, 4) if loss_rate is not None else None,
+			"loss_basis": f"{self.prediction_loss_basis} ({loss_rate:.1%} historical rate)" if loss_rate is not None else self.prediction_loss_basis,
 		}
 
 	def predict(self, quantity: int, sales: float, discount: float, category: str, region: str) -> dict[str, object]:

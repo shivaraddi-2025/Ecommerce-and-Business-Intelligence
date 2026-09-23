@@ -9,9 +9,11 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .analytics import AnalyticsEngine
@@ -49,9 +51,17 @@ def resolve_dataset_path() -> Path:
 DATASET = resolve_dataset_path()
 
 app = FastAPI(title="Nexus Commerce Intelligence API", version="1.0.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 security = HTTPBearer(auto_error=False)
 engine = AnalyticsEngine(DATASET)
 users: dict[str, dict[str, str]] = {}
+DIST_DIR = ROOT / "frontend" / "dist"
 
 
 def hash_password(password: str, salt: bytes | None = None) -> str:
@@ -120,6 +130,8 @@ class PredictionRequest(BaseModel):
 
 @app.get("/", include_in_schema=False)
 def frontend() -> FileResponse:
+    if DIST_DIR.exists() and (DIST_DIR / "index.html").exists():
+        return FileResponse(DIST_DIR / "index.html")
     return FileResponse(ROOT / "frontend" / "index.html")
 
 
@@ -166,8 +178,14 @@ def sales_daily_report(region: str | None = None, category: str | None = None, y
 
 
 @app.get("/api/sales/daily/forecast")
-def sales_daily_forecast(date: str | None = None, year: str | None = None, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
-    return engine.forecast_daily_sales(date, year)
+def sales_daily_forecast(
+    date: str | None = None,
+    year: str | None = None,
+    sales: float | None = Query(default=None, ge=0),
+    days: int = Query(default=1, ge=1, le=30),
+    user: dict[str, str] = Depends(current_user),
+) -> dict[str, object]:
+    return engine.forecast_daily_sales(date, year, days, sales)
 
 
 @app.get("/api/sales/category")
@@ -265,3 +283,11 @@ async def upload_dataset(file: UploadFile = File(...), user: dict[str, str] = De
     engine = AnalyticsEngine(DATASET)
 
     return {"status": "uploaded", "filename": file.filename}
+if DIST_DIR.exists():
+    app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="frontend_assets")
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def frontend_fallback(full_path: str) -> FileResponse:
+        if full_path.startswith("api") or full_path.startswith("docs") or full_path.startswith("openapi"):
+            raise HTTPException(status_code=404, detail="Not found")
+        return FileResponse(DIST_DIR / "index.html")
