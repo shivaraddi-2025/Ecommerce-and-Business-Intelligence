@@ -1,0 +1,25 @@
+# Environment files and credentials
+.env
+.env.*
+!.env.example
+*firebase*admin*.json
+
+# Local dependencies and Python caches
+node_modules/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Generated builds, logs, and local databases
+dist/
+*.log
+*.db
+*.sqlite
+*.sqlite3
+
+# Local runtime data
+data/raw/
+data/users.db
+data/.active_dataset_path.txt
