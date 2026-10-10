@@ -115,6 +115,80 @@ def test_demo_user_can_login() -> None:
     assert payload["access_token"].startswith("eyJ")
 
 
+def test_admin_can_invite_user_who_can_sign_in() -> None:
+    admin_token = main.token_for("invite-admin@example.com", "Admin")
+    email = "new-invite@example.com"
+    response = client.post(
+        "/api/management/users/invite",
+        json={"email": email, "password": "temporary-password", "role": "Analyst"},
+        headers={"Authorization": f"Bearer {admin_token}"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["email"] == email
+    assert response.json()["role"] == "Analyst"
+
+    login = client.post(
+        "/api/auth/login",
+        json={"email": email, "password": "temporary-password"},
+    )
+    assert login.status_code == 200
+    assert login.json()["role"] == "Analyst"
+
+
+def test_business_manager_cannot_invite_admin() -> None:
+    manager_token = main.token_for("invite-manager@example.com", "Business Manager")
+    response = client.post(
+        "/api/management/users/invite",
+        json={"email": "new-admin-invite@example.com", "password": "temporary-password", "role": "Admin"},
+        headers={"Authorization": f"Bearer {manager_token}"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_viewer_cannot_invite_user() -> None:
+    viewer_token = main.token_for("invite-viewer@example.com", "Viewer")
+    response = client.post(
+        "/api/management/users/invite",
+        json={"email": "forbidden-invite@example.com", "password": "temporary-password", "role": "Viewer"},
+        headers={"Authorization": f"Bearer {viewer_token}"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_registration_stores_scrypt_password_hash() -> None:
+    email = "password-hash@example.com"
+    password = "registration-password"
+    response = client.post("/api/auth/register", json={"email": email, "password": password})
+
+    assert response.status_code == 200
+    with main.get_session() as session:
+        user = main.get_user_by_email(session, email)
+        assert user is not None
+        assert user.password.startswith("scrypt$")
+        assert user.password != password
+        assert main.verify_password(password, user.password)
+
+
+def test_login_upgrades_legacy_plaintext_password() -> None:
+    email = "legacy-password@example.com"
+    password = "legacy-password"
+    with main.get_session() as session:
+        main.create_user(session, email, password, role="Viewer")
+
+    response = client.post("/api/auth/login", json={"email": email, "password": password})
+
+    assert response.status_code == 200
+    with main.get_session() as session:
+        user = main.get_user_by_email(session, email)
+        assert user is not None
+        assert user.password.startswith("scrypt$")
+        assert user.password != password
+        assert main.verify_password(password, user.password)
+
+
 def test_day_level_sales_endpoint_returns_daily_records() -> None:
     email = "daily-analysis@example.com"
     register = client.post(

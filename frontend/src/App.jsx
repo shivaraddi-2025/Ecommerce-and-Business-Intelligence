@@ -60,8 +60,6 @@ const navGroups = [
     items: [
       { key: 'forecast', label: 'Sales Forecast', icon: '🔮' },
       { key: 'anomalies', label: 'Anomaly Detection', icon: '🚨' },
-      { key: 'advisor', label: 'AI Business Advisor', icon: '🤖' },
-      { key: 'custpred', label: 'Customer Prediction', icon: '🎯' },
     ],
   },
   {
@@ -97,6 +95,32 @@ const Icon = ({ name }) => {
   return icons[name] || null;
 };
 
+function PasswordVisibilityToggle({ visible, onToggle, label = 'password' }) {
+  return (
+    <button
+      type="button"
+      className="password-visibility-toggle"
+      onClick={onToggle}
+      aria-label={`${visible ? 'Hide' : 'Show'} ${label}`}
+      title={`${visible ? 'Hide' : 'Show'} ${label}`}
+    >
+      {visible ? (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M3 3l18 18" />
+          <path d="M10.6 10.6a2 2 0 0 0 2.8 2.8" />
+          <path d="M9.9 5.2A10.8 10.8 0 0 1 12 5c5 0 8.5 4.5 9.5 7-.4 1-1.2 2.1-2.3 3.1" />
+          <path d="M6.2 6.2C4.2 7.5 2.9 9.5 2.5 12c.8 2.4 4.3 7 9.5 7a10 10 0 0 0 3-.5" />
+        </svg>
+      ) : (
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M2.5 12S6 5 12 5s9.5 7 9.5 7-3.5 7-9.5 7-9.5-7-9.5-7Z" />
+          <circle cx="12" cy="12" r="3" />
+        </svg>
+      )}
+    </button>
+  );
+}
+
 function formatCurrency(value) {
   return new Intl.NumberFormat('en-IN', {
     style: 'currency',
@@ -120,21 +144,6 @@ function formatNumber(value) {
 
 function formatPercent(value) {
   return `${Number(value || 0).toFixed(2)}%`;
-}
-
-function toCsv(rows) {
-  if (!Array.isArray(rows) || !rows.length) return '';
-  const headers = Array.from(rows.reduce((acc, r) => { Object.keys(r || {}).forEach((k) => acc.add(k)); return acc; }, new Set()));
-  const esc = (v) => {
-    if (v === null || v === undefined) return '';
-    const s = String(v).replace(/"/g, '""');
-    return /[",\n\r]/.test(s) ? `"${s}"` : s;
-  };
-  const lines = [headers.map(esc).join(',')];
-  for (const r of rows) {
-    lines.push(headers.map((h) => esc(r?.[h])).join(','));
-  }
-  return lines.join('\r\n');
 }
 
 async function apiRequest(path, token, options = {}, returnBlob = false) {
@@ -181,7 +190,8 @@ async function apiRequest(path, token, options = {}, returnBlob = false) {
 
 function auditLog(action, status = 'success', extra = {}) {
   try {
-    const existing = JSON.parse(localStorage.getItem('nexus_audit') || '[]');
+    const parsed = JSON.parse(localStorage.getItem('nexus_audit') || '[]');
+    const existing = Array.isArray(parsed) ? parsed : [];
     const entry = {
       timestamp: new Date().toISOString(),
       actor: localStorage.getItem('nexus_role') || 'Viewer',
@@ -191,9 +201,25 @@ function auditLog(action, status = 'success', extra = {}) {
     };
     existing.push(entry);
     localStorage.setItem('nexus_audit', JSON.stringify(existing.slice(-500)));
-  } catch (e) {
-    // non-breaking
+    window.dispatchEvent(new Event('nexus:audit-updated'));
+  } catch (error) {
+    console.error('Unable to save audit log entry', error);
   }
+}
+
+function getAuditEvents() {
+  try {
+    const parsed = JSON.parse(localStorage.getItem('nexus_audit') || '[]');
+    return Array.isArray(parsed) ? parsed.filter((event) => event && typeof event === 'object') : [];
+  } catch (error) {
+    console.error('Unable to read audit log entries', error);
+    return [];
+  }
+}
+
+function formatAuditValue(value) {
+  if (value === null || value === undefined || value === '') return '—';
+  return typeof value === 'object' ? JSON.stringify(value) : String(value);
 }
 
 const defaultFilters = { region: '', city: '', category: '', customer_segment: '', year: '' };
@@ -258,6 +284,8 @@ export default function App() {
   const [role, setRole] = useState(localStorage.getItem('nexus_role') || 'Viewer');
   const [activeView, setActiveView] = useState('overview');
   const [filters, setFilters] = useState(defaultFilters);
+  const [exportYear, setExportYear] = useState('');
+  const [exportMonth, setExportMonth] = useState('');
   const [meta, setMeta] = useState({ regions: [], categories: [], cities: [], customer_segments: [], years: [] });
   const [dashboard, setDashboard] = useState({
     kpis: {},
@@ -290,6 +318,7 @@ export default function App() {
   const [viewLoadedAt, setViewLoadedAt] = useState({});
   const [viewRefresh, setViewRefresh] = useState({});
   const [loginForm, setLoginForm] = useState({ email: 'demo@example.com', password: 'demo-password' });
+  const [showLoginPassword, setShowLoginPassword] = useState(false);
   const [authStatus, setAuthStatus] = useState({ type: '', message: '' });
 
   const [authLoading, setAuthLoading] = useState(false);
@@ -329,8 +358,11 @@ export default function App() {
   const [usersList, setUsersList] = useState(null);
   const [usersEdit, setUsersEdit] = useState({});
   const [inviteForm, setInviteForm] = useState({ email: '', password: '', role: 'Viewer' });
+  const [showInvitePassword, setShowInvitePassword] = useState(false);
+  const [inviteStatus, setInviteStatus] = useState({ type: '', message: '' });
   const [usersSaving, setUsersSaving] = useState({});
   const [inviteSubmitting, setInviteSubmitting] = useState(false);
+  const [auditRevision, setAuditRevision] = useState(0);
   const [appSettings, setAppSettings] = useState(() => {
     try {
       return JSON.parse(localStorage.getItem('nexus_settings') || '{}') || { theme: 'dark', forecastHorizon: 7 };
@@ -568,6 +600,7 @@ export default function App() {
   const authenticated = Boolean(token);
   const loading = baseLoading || viewLoading;
   const activeFilterCount = [filters.region, filters.city, filters.category, filters.customer_segment, filters.year].filter(Boolean).length;
+  const auditEntries = useMemo(() => getAuditEvents(), [auditRevision]);
   const cacheKey = useMemo(() => JSON.stringify(filters) + '|' + dataVersion, [filters, dataVersion]);
   const viewKey = useMemo(() => cacheKey + '|v' + (viewRefresh[activeView] || 0), [cacheKey, viewRefresh, activeView]);
   const isViewFresh = viewLoadedAt[activeView] === viewKey;
@@ -580,6 +613,16 @@ export default function App() {
     };
     window.addEventListener('nexus:unauthorized', handleUnauthorized);
     return () => window.removeEventListener('nexus:unauthorized', handleUnauthorized);
+  }, []);
+
+  useEffect(() => {
+    const refreshAuditEntries = () => setAuditRevision((revision) => revision + 1);
+    window.addEventListener('nexus:audit-updated', refreshAuditEntries);
+    window.addEventListener('storage', refreshAuditEntries);
+    return () => {
+      window.removeEventListener('nexus:audit-updated', refreshAuditEntries);
+      window.removeEventListener('storage', refreshAuditEntries);
+    };
   }, []);
 
   useEffect(() => {
@@ -605,6 +648,7 @@ export default function App() {
           categories: kpisData.filters?.categories || [],
           cities: kpisData.filters?.cities || [],
           customer_segments: kpisData.filters?.customer_segments || ['Loyal', 'New', 'Returning'],
+          years: kpisData.filters?.years || prev.years,
         }));
         setViewLoadedAt({});
         setStatus('Filters ready · choose a section below');
@@ -3225,7 +3269,7 @@ export default function App() {
             )}
             <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">RECENT IMPORT HISTORY</div><h2>Recent Actions</h2></div></div>
               <div className="table-wrap"><table className="styled-table"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Status</th></tr></thead><tbody>
-                {(JSON.parse(localStorage.getItem('nexus_audit') || '[]')).filter((e) => /upload|sync|import/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
+                {auditEntries.filter((e) => /upload|sync|import/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
                   <tr key={`ih-${i}`}>
                     <td>{new Date(e.timestamp).toLocaleString()}</td>
                     <td>{e.actor}</td>
@@ -3233,7 +3277,7 @@ export default function App() {
                     <td><span className={`risk-chip ${e.status === 'success' ? '' : 'high'}`}>{e.status}</span></td>
                   </tr>
                 ))}
-                {!JSON.parse(localStorage.getItem('nexus_audit') || '[]').filter((e) => /upload|sync|import/i.test(e.action)).length && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
+                {!auditEntries.some((e) => /upload|sync|import/i.test(e.action)) && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
               </tbody></table></div>
             </section>
           </div>
@@ -3241,50 +3285,55 @@ export default function App() {
       }
       case 'export': {
         const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-        const downloadCsv = (csvText, filename) => {
-          const bom = '\uFEFF';
-          const blob = new Blob([bom + csvText], { type: 'text/csv;charset=utf-8' });
-          const url = URL.createObjectURL(blob);
-          const a = document.createElement('a');
-          a.href = url;
-          a.download = filename.replace('{{TS}}', stamp);
-          document.body.appendChild(a);
-          a.click();
-          a.remove();
-          setTimeout(() => URL.revokeObjectURL(url), 1000);
-        };
-        const doExport = async (endpoint, filename, extractor) => {
+        const formattedMonth = exportMonth ? exportMonth.padStart(2, '0') : '';
+        const periodLabel = exportYear && formattedMonth
+          ? `${exportYear}-${formattedMonth}`
+          : exportYear || (formattedMonth ? `all-years-${formattedMonth}` : 'all-periods');
+        const getExportFilename = (filename, format) => (
+          filename
+            .replace(/\.(xlsx|pdf)$/i, `.${format}`)
+            .replace('{{PERIOD}}', periodLabel)
+            .replace('{{TS}}', stamp)
+        );
+        const doExport = async (endpoint, filename, extractor, format) => {
+          const downloadFilename = getExportFilename(filename, format);
           try {
-            setStatus(`Exporting ${filename}…`);
-            const extra = buildQuery(filters);
-            const url = extra ? (endpoint.includes('?') ? `${endpoint}${extra.replace('?', '&')}` : `${endpoint}${extra}`) : endpoint;
+            setStatus(`Exporting ${downloadFilename}…`);
+            const queryFilters = buildQuery({ ...filters, year: exportYear }).replace(/^\?/, '');
+            const params = new URLSearchParams(queryFilters);
+            if (exportMonth) params.set('month', exportMonth);
+            const separator = endpoint.includes('?') ? '&' : '?';
+            const url = params.toString() ? `${endpoint}${separator}${params.toString()}` : endpoint;
             const data = await apiRequest(url, token);
             const rows = extractor ? extractor(data) : (Array.isArray(data) ? data : (data?.records || data?.daily || data?.days || data?.rows || data?.items || data?.data || []));
             if (!Array.isArray(rows) || rows.length === 0) {
               throw new Error('No rows returned for export.');
             }
-            const csv = toCsv(rows);
-            downloadCsv(csv, filename);
-            auditLog('export', 'success', { filename, rows: rows.length });
-            setStatus(`Exported ${filename} (${formatNumber(rows.length)} rows)`);
+            const { downloadRows } = await import('./exportFiles.js');
+            const title = downloadFilename.replace(/[-_]\d{4}-\d{2}-\d{2}T.*/, '').replace(/[-_]/g, ' ');
+            await downloadRows(rows, downloadFilename, format, title);
+            auditLog('export', 'success', { filename: downloadFilename, rows: rows.length, format });
+            setStatus(`Exported ${downloadFilename} (${formatNumber(rows.length)} rows)`);
+            return true;
           } catch (e) {
             const msg = e?.message || String(e) || 'Unknown error';
-            auditLog('export', 'fail', { filename, error: msg });
+            auditLog('export', 'fail', { filename: downloadFilename, format, error: msg });
             setStatus(`Export failed: ${msg}`);
+            return false;
           }
         };
-        const doFullReport = async () => {
-          setStatus('Running full report…');
+        const doFullReport = async (format) => {
+          setStatus(`Running full ${format.toUpperCase()} report…`);
           const jobs = [
-            { endpoint: '/api/sales/records?limit=500000', filename: 'report-sales-{{TS}}.csv', extractor: salesExtractor },
-            { endpoint: '/api/sales/daily/report', filename: 'report-daily-{{TS}}.csv', extractor: dailyExtractor },
-            { endpoint: '/api/products/top?limit=500', filename: 'report-products-{{TS}}.csv' },
-            { endpoint: '/api/customers/top?limit=500', filename: 'report-customers-{{TS}}.csv' },
+            { endpoint: '/api/sales/records?limit=500000', filename: 'report-sales-{{PERIOD}}-{{TS}}.xlsx', extractor: salesExtractor },
+            { endpoint: '/api/sales/daily/report', filename: 'report-daily-{{PERIOD}}-{{TS}}.xlsx', extractor: dailyExtractor },
+            { endpoint: '/api/products/top?limit=500', filename: 'report-products-{{PERIOD}}-{{TS}}.xlsx' },
+            { endpoint: '/api/customers/top?limit=500', filename: 'report-customers-{{PERIOD}}-{{TS}}.xlsx' },
           ];
-          const results = await Promise.allSettled(jobs.map((j) => doExport(j.endpoint, j.filename, j.extractor)));
-          const ok = results.filter((r) => r.status === 'fulfilled').length;
-          auditLog('report', ok === jobs.length ? 'success' : 'partial', { files: jobs.length, ok });
-          setStatus(`Report complete: ${ok}/${jobs.length} generated`);
+          const results = await Promise.all(jobs.map((job) => doExport(job.endpoint, job.filename, job.extractor, format)));
+          const ok = results.filter(Boolean).length;
+          auditLog('report', ok === jobs.length ? 'success' : 'partial', { format, files: jobs.length, ok });
+          setStatus(`${format.toUpperCase()} report complete: ${ok}/${jobs.length} files generated`);
         };
         const salesExtractor = (d) => d?.records || d || [];
         const dailyExtractor = (d) => {
@@ -3299,44 +3348,93 @@ export default function App() {
                 <div>
                   <div className="hero-badge"><Icon name="spark" /> EXPORT &amp; REPORTS</div>
                   <h1 className="hero-title">Download reports and export data</h1>
-                  <p className="panel-subtitle">All exports honour the current Filters (region, category, segment, year). Reports include timestamp.</p>
+                  <p className="panel-subtitle">Choose a year and month for downloads. Other exports use the current region, category, and segment filters.</p>
                 </div>
                 <div className="hero-stats">
                   <div><strong>4</strong><span>Exporters</span></div>
                   <div className="divider" />
-                  <div><strong>CSV</strong><span>Format</span></div>
+                  <div><strong>2</strong><span>Formats: Excel, PDF</span></div>
                   <div className="divider" />
                   <div><strong>{stamp.slice(0, 10)}</strong><span>Generated</span></div>
                 </div>
               </div>
             </section>
+            <section className="panel wide">
+              <div className="panel-head">
+                <div><div className="panel-eyebrow">DATE RANGE</div><h2>Choose export year and month</h2></div>
+                <span className="muted small">Selected period: {exportMonth ? new Date(2000, Number(exportMonth) - 1).toLocaleString('en', { month: 'long' }) : 'All months'}{exportYear ? ` ${exportYear}` : ' · All years'}</span>
+              </div>
+              <div className="toolbar-fields export-period-fields">
+                <div className="field">
+                  <label>📅 Year</label>
+                  <select value={exportYear} onChange={(event) => setExportYear(event.target.value)}>
+                    <option value="">All years</option>
+                    {meta.years.map((year) => <option key={year} value={year}>{year}</option>)}
+                  </select>
+                </div>
+                <div className="field">
+                  <label>🗓️ Month</label>
+                  <select value={exportMonth} onChange={(event) => setExportMonth(event.target.value)}>
+                    <option value="">All months</option>
+                    {Array.from({ length: 12 }, (_, index) => {
+                      const month = String(index + 1);
+                      return <option key={month} value={month}>{new Date(2000, index).toLocaleString('en', { month: 'long' })}</option>;
+                    })}
+                  </select>
+                </div>
+              </div>
+            </section>
             <section className="panel"><div className="panel-head"><div><div className="panel-eyebrow">DOWNLOADS</div><h2>Data Extracts</h2></div></div>
-              <div className="stat-stack">
-                <button className="metric-box gold" onClick={() => doExport('/api/sales/records?limit=500000', `nexus-sales-{{TS}}.csv`, salesExtractor)} style={{ textAlign: 'left', cursor: 'pointer' }}><span>📄 Sales Records (CSV)</span><strong>All rows</strong><small>Filtered; up to 500k rows</small></button>
-                <button className="metric-box slate" onClick={() => doExport('/api/products/top?limit=500', `nexus-top-products-{{TS}}.csv`)} style={{ textAlign: 'left', cursor: 'pointer' }}><span>🏆 Top Products (CSV)</span><strong>Ranked</strong><small>By revenue, units, margin</small></button>
-                <button className="metric-box orange" onClick={() => doExport('/api/customers/top?limit=500', `nexus-top-customers-{{TS}}.csv`)} style={{ textAlign: 'left', cursor: 'pointer' }}><span>👥 Top Customers (CSV)</span><strong>VIP roster</strong><small>With LTV, orders, segment</small></button>
-                <button className="metric-box" onClick={() => doExport('/api/sales/daily/report', `nexus-daily-agg-{{TS}}.csv`, dailyExtractor)} style={{ textAlign: 'left', cursor: 'pointer' }}><span>📊 Daily Aggregates (CSV)</span><strong>Rollup</strong><small>Per-day sales, returns, margin</small></button>
+              <div className="stat-stack export-stat-stack">
+                {[
+                  { title: '📄 Sales Records', detail: 'All rows', note: 'Filtered; up to 500k rows', tone: 'gold', endpoint: '/api/sales/records?limit=500000', filename: 'nexus-sales-{{PERIOD}}-{{TS}}.xlsx', extractor: salesExtractor },
+                  { title: '🏆 Top Products', detail: 'Ranked', note: 'By revenue, units, margin', tone: 'slate', endpoint: '/api/products/top?limit=500', filename: 'nexus-top-products-{{PERIOD}}-{{TS}}.xlsx' },
+                  { title: '👥 Top Customers', detail: 'VIP roster', note: 'With LTV, orders, segment', tone: 'orange', endpoint: '/api/customers/top?limit=500', filename: 'nexus-top-customers-{{PERIOD}}-{{TS}}.xlsx' },
+                  { title: '📊 Daily Aggregates', detail: 'Rollup', note: 'Per-day sales, returns, margin', endpoint: '/api/sales/daily/report', filename: 'nexus-daily-agg-{{PERIOD}}-{{TS}}.xlsx', extractor: dailyExtractor },
+                ].map((item) => (
+                  <div className={`metric-box ${item.tone || ''}`} key={item.filename}>
+                    <span>{item.title}</span><strong>{item.detail}</strong><small>{item.note}</small>
+                    <div className="export-format-actions" aria-label={`Download ${item.title} as`}>
+                      {['xlsx', 'pdf'].map((format) => (
+                        <button key={format} type="button" onClick={() => doExport(item.endpoint, item.filename, item.extractor, format)}>
+                          {format === 'xlsx' ? 'Excel' : 'PDF'}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ))}
               </div>
             </section>
             <section className="panel"><div className="panel-head"><div><div className="panel-eyebrow">FULL REPORT</div><h2>Generate Comprehensive Report</h2></div></div>
-              <div className="insight" style={{ marginBottom: 14 }}>📦 Runs 4 exports in parallel and packages a complete snapshot with KPIs, segment breakdown, daily aggregates, top buyers, and SKU rankings.</div>
-              <button className="primary-cta" onClick={doFullReport}>🗂️ Generate Full Report (4 files)</button>
+              <div className="insight" style={{ marginBottom: 14 }}>📦 Download all 4 report extracts for {exportMonth ? new Date(2000, Number(exportMonth) - 1).toLocaleString('en', { month: 'long' }) : 'all months'}{exportYear ? ` ${exportYear}` : ' across all years'} in your chosen file format.</div>
+              <div className="export-full-report-actions">
+                <button className="primary-cta" onClick={() => doFullReport('xlsx')}>🗂️ Generate Excel Report (4 files)</button>
+                <button className="secondary-cta" onClick={() => doFullReport('pdf')}>📄 Generate PDF Report (4 files)</button>
+              </div>
             </section>
             <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">HISTORY</div><h2>Recent Exports</h2></div></div>
               <div className="table-wrap"><table className="styled-table"><thead><tr><th>Timestamp</th><th>Actor</th><th>Action</th><th>Status</th></tr></thead><tbody>
-                {(JSON.parse(localStorage.getItem('nexus_audit') || '[]')).filter((e) => /export|report/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
+                {auditEntries.filter((e) => /export|report/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
                   <tr key={`eh-${i}`}><td>{new Date(e.timestamp).toLocaleString()}</td><td>{e.actor}</td><td>{e.action}</td><td><span className={`risk-chip ${e.status === 'success' ? '' : 'high'}`}>{e.status}</span></td></tr>
                 ))}
-                {!JSON.parse(localStorage.getItem('nexus_audit') || '[]').filter((e) => /export|report/i.test(e.action)).length && <tr><td colSpan={4} className="empty-row">No exports yet — click any extract above to begin.</td></tr>}
+                {!auditEntries.some((e) => /export|report/i.test(e.action)) && <tr><td colSpan={4} className="empty-row">No exports yet — click any extract above to begin.</td></tr>}
               </tbody></table></div>
             </section>
           </div>
         );
       }
       case 'audit': {
-        const raw = (() => { try { return JSON.parse(localStorage.getItem('nexus_audit') || '[]'); } catch { return []; } })();
-        const rows = [...raw].reverse();
-        const clear = () => { if (role === 'Admin') { localStorage.removeItem('nexus_audit'); setViewRefresh((p) => ({ ...p, audit: (p.audit || 0) + 1 })); auditLog('audit_clear', 'success'); } };
+        const rows = [...auditEntries].reverse();
+        const clear = () => {
+          if (role !== 'Admin') return;
+          try {
+            localStorage.removeItem('nexus_audit');
+            auditLog('audit_clear', 'success');
+          } catch (error) {
+            console.error('Unable to clear audit log entries', error);
+            setStatus('Unable to clear audit log entries');
+          }
+        };
         return (
           <div className="content-grid">
             <section className="panel hero-panel wide" style={{ background: 'linear-gradient(135deg, rgba(244,114,182,0.08), rgba(130,88,255,0.16) 70%)' }}>
@@ -3344,7 +3442,7 @@ export default function App() {
                 <div>
                   <div className="hero-badge"><Icon name="spark" /> AUDIT LOGS</div>
                   <h1 className="hero-title">Recent activity log</h1>
-                  <p className="panel-subtitle">Captured via auditLog() helper. Persists in localStorage <code>nexus_audit</code>. Admin-only clear.</p>
+                  <p className="panel-subtitle">Activity is recorded in this browser and refreshes as events are logged. Admin-only clear.</p>
                 </div>
                 <div className="hero-stats">
                   <div><strong>{formatNumber(rows.length)}</strong><span>Events</span></div>
@@ -3361,10 +3459,10 @@ export default function App() {
                 {rows.map((r, i) => (
                   <tr key={`aud-${i}-${r.timestamp}-${r.action}`}>
                     <td>{new Date(r.timestamp).toLocaleString()}</td>
-                    <td><span className="badge-accent">{r.actor || 'Viewer'}</span></td>
-                    <td><strong>{r.action}</strong></td>
-                    <td><span className={`risk-chip ${r.status === 'success' ? '' : r.status === 'fail' ? 'high' : 'medium'}`}>{r.status || '—'}</span></td>
-                    <td className="muted small">{r.email || r.filename || r.details || (r.error ? String(r.error).slice(0, 80) : '') || '—'}</td>
+                    <td><span className="badge-accent">{formatAuditValue(r.actor || 'Viewer')}</span></td>
+                    <td><strong>{formatAuditValue(r.action)}</strong></td>
+                    <td><span className={`risk-chip ${r.status === 'success' ? '' : r.status === 'fail' ? 'high' : 'medium'}`}>{formatAuditValue(r.status)}</span></td>
+                    <td className="muted small">{formatAuditValue(r.email || r.filename || r.details || (r.error ? String(r.error).slice(0, 80) : ''))}</td>
                   </tr>
                 ))}
                 {rows.length === 0 && <tr><td colSpan={5} className="empty-row">No audit events yet.</td></tr>}
@@ -3394,7 +3492,11 @@ export default function App() {
           try {
             const ul = await apiRequest('/api/management/users', token);
             setUsersList(ul);
-          } catch {}
+            return true;
+          } catch (error) {
+            console.error('Failed to refresh users:', error);
+            return false;
+          }
         };
         const saveRole = async (u) => {
           const patchRole = usersEdit[u.id] && ROLES.includes(usersEdit[u.id]) ? usersEdit[u.id] : null;
@@ -3430,21 +3532,37 @@ export default function App() {
         };
         const submitInvite = async (e) => {
           if (e) e.preventDefault();
-          if (!inviteForm.email || !inviteForm.password) {
-            setStatus('Email and password are required to invite a user');
+          const email = inviteForm.email.trim();
+          if (!email || !inviteForm.password) {
+            setInviteStatus({ type: 'error', message: 'Email and temporary password are required.' });
+            return;
+          }
+          if (inviteForm.password.length < 8) {
+            setInviteStatus({ type: 'error', message: 'Temporary password must be at least 8 characters.' });
             return;
           }
           try {
             setInviteSubmitting(true);
-            await apiRequest('/api/management/users/invite', token, {
+            setInviteStatus({ type: 'info', message: 'Creating the user account…' });
+            const created = await apiRequest('/api/management/users/invite', token, {
               method: 'POST',
-              body: JSON.stringify({ email: inviteForm.email, password: inviteForm.password, role: inviteForm.role || 'Viewer' }),
+              body: JSON.stringify({ email, password: inviteForm.password, role: inviteForm.role || 'Viewer' }),
             });
             setInviteForm({ email: '', password: '', role: 'Viewer' });
-            setStatus('Invite created');
-            await refreshUsers();
+            setShowInvitePassword(false);
+            setInviteStatus({
+              type: 'success',
+              message: `User account created for ${created.email}. Share the temporary password securely; the user can sign in now.`,
+            });
+            const directoryRefreshed = await refreshUsers();
+            if (!directoryRefreshed) {
+              setInviteStatus({
+                type: 'success',
+                message: `User account created for ${created.email}, but the directory could not refresh. Reload the page to see it.`,
+              });
+            }
           } catch (err) {
-            setStatus(err.message || 'Failed to create invite');
+            setInviteStatus({ type: 'error', message: err.message || 'Failed to create user account.' });
           } finally {
             setInviteSubmitting(false);
           }
@@ -3476,22 +3594,31 @@ export default function App() {
                   <form onSubmit={submitInvite} className="stat-stack" style={{ gap: 10 }}>
                     <div className="field" style={{ marginTop: 4 }}>
                       <label>Work email</label>
-                      <input value={inviteForm.email} onChange={(e) => setInviteForm((p) => ({ ...p, email: e.target.value }))} placeholder="name@company.com" />
+                      <input type="email" autoComplete="email" required value={inviteForm.email} onChange={(e) => { setInviteForm((p) => ({ ...p, email: e.target.value })); setInviteStatus({ type: '', message: '' }); }} placeholder="name@company.com" />
                     </div>
                     <div className="field" style={{ marginTop: 4 }}>
                       <label>Temporary password</label>
-                      <input type="password" value={inviteForm.password} onChange={(e) => setInviteForm((p) => ({ ...p, password: e.target.value }))} placeholder="Min 8 characters" />
+                      <div className="password-input-wrap">
+                        <input type={showInvitePassword ? 'text' : 'password'} required minLength={8} autoComplete="new-password" value={inviteForm.password} onChange={(e) => { setInviteForm((p) => ({ ...p, password: e.target.value })); setInviteStatus({ type: '', message: '' }); }} placeholder="Min 8 characters" />
+                        <PasswordVisibilityToggle visible={showInvitePassword} onToggle={() => setShowInvitePassword((visible) => !visible)} label="temporary password" />
+                      </div>
                     </div>
                     <div className="field" style={{ marginTop: 4 }}>
                       <label>Role</label>
                       <select value={inviteForm.role || 'Viewer'} onChange={(e) => setInviteForm((p) => ({ ...p, role: e.target.value }))}>
-                        {ROLES.map((rr) => <option key={rr} value={rr}>{rr}</option>)}
+                        {ROLES.filter((rr) => isAdmin || rr !== 'Admin').map((rr) => <option key={rr} value={rr}>{rr}</option>)}
                       </select>
                     </div>
+                    {inviteStatus.message && (
+                      <div className={`status-alert ${inviteStatus.type}`} role="status" aria-live="polite">
+                        {inviteStatus.type === 'success' ? '✅ ' : inviteStatus.type === 'error' ? '⚠️ ' : 'ℹ️ '}
+                        {inviteStatus.message}
+                      </div>
+                    )}
                     <button type="submit" className="cta-primary" style={{ marginTop: 6 }} disabled={inviteSubmitting}>
                       {inviteSubmitting ? 'Creating…' : '+ Invite user'}
                     </button>
-                    <div className="insight" style={{ marginTop: 6 }}>🔐 Password is hashed (sha256 + salt) before storage. Share the password securely with the new user.</div>
+                    <div className="insight" style={{ marginTop: 6 }}>🔐 This creates an account immediately; it does not send email. Share the temporary password securely. Passwords are stored using salted scrypt hashing.</div>
                   </form>
                 </section>
                 <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">DIRECTORY</div><h2>All Users</h2><div className="panel-subtitle" style={{ marginTop: 4 }}>{isAdmin ? 'Click a ROLE badge to edit it, then save. Remove users with the 🗑️ action. You cannot edit or delete yourself.' : 'Only Admins can change roles and delete users.'}</div></div><span className="badge-good">{formatNumber(total || list.length)} members</span></div>
@@ -3747,13 +3874,17 @@ export default function App() {
               </label>
               <label>
                 <span>Password</span>
-                <input
-                  type="password"
-                  value={loginForm.password}
-                  onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
-                  placeholder="••••••••"
-                  required
-                />
+                <div className="password-input-wrap">
+                  <input
+                    type={showLoginPassword ? 'text' : 'password'}
+                    value={loginForm.password}
+                    onChange={(e) => setLoginForm({ ...loginForm, password: e.target.value })}
+                    placeholder="••••••••"
+                    autoComplete="current-password"
+                    required
+                  />
+                  <PasswordVisibilityToggle visible={showLoginPassword} onToggle={() => setShowLoginPassword((visible) => !visible)} />
+                </div>
               </label>
               <button type="submit" className="primary-cta" disabled={authLoading}>
                 {authLoading ? 'Signing in…' : 'Enter Workspace ⚡'}
@@ -3763,7 +3894,7 @@ export default function App() {
           <div className="login-hint" style={{ marginTop: 22 }}>
             <strong>Demo Admin:</strong> demo@example.com · demo-password
             <div style={{ marginTop: 4, fontSize: '0.75rem', color: 'var(--muted)' }}>
-              💾 All accounts & passwords automatically save to SQL Database
+              💾 Accounts save to SQL; passwords are protected with salted scrypt hashing.
             </div>
           </div>
         </div>
@@ -3787,7 +3918,10 @@ export default function App() {
               <div className="nav-label">{group.label}</div>
             <nav>
               {group.items.map((item) => (
-                <button key={item.key} className={item.key === activeView ? 'active' : ''} onClick={() => setActiveView(item.key)}>
+                <button key={item.key} className={item.key === activeView ? 'active' : ''} onClick={() => {
+                  if (item.key !== activeView) auditLog('view_access', 'success', { details: item.label });
+                  setActiveView(item.key);
+                }}>
                   <span className="nav-icon">{item.icon}</span>
                   <span>{item.label}</span>
                 </button>

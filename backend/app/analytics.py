@@ -156,6 +156,10 @@ class AnalyticsEngine:
 		return sorted(base)
 
 	@property
+	def years(self) -> list[str]:
+		return sorted(self.frame["Order Date"].dropna().dt.year.astype(str).unique().tolist())
+
+	@property
 	def regions(self) -> list[str]:
 		base = set(self.frame["Region"].dropna().astype(str).str.strip().str.title().unique().tolist())
 		base.update(self.custom_regions)
@@ -243,6 +247,7 @@ class AnalyticsEngine:
 		year: str | None = None,
 		city: str | None = None,
 		customer_segment: str | None = None,
+		month: int | str | None = None,
 	) -> pd.DataFrame:
 		frame = self.frame
 		regions = self._parse_filter_values(region)
@@ -262,6 +267,13 @@ class AnalyticsEngine:
 				year_value = int(str(year))
 				frame = frame[frame["Order Date"].dt.year.eq(year_value)]
 			except Exception:
+				pass
+		if month:
+			try:
+				month_value = int(month)
+				if 1 <= month_value <= 12:
+					frame = frame[frame["Order Date"].dt.month.eq(month_value)]
+			except (TypeError, ValueError):
 				pass
 		return frame
 
@@ -305,8 +317,8 @@ class AnalyticsEngine:
 		result["Order Date"] = result["Order Date"].dt.strftime("%Y-%m-%d")
 		return result.round(2).to_dict("records")
 
-	def daily_performance_report(self, region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None) -> dict[str, object]:
-		frame = self.filtered(region, category, year, city).copy()
+	def daily_performance_report(self, region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | str | None = None, customer_segment: str | None = None) -> dict[str, object]:
+		frame = self.filtered(region, category, year, city, customer_segment, month).copy()
 		frame["Order Date"] = pd.to_datetime(frame["Order Date"], errors="coerce").dt.normalize()
 		daily = frame.groupby("Order Date", as_index=False).agg(
 			sales=("Sales", "sum"),
@@ -364,8 +376,10 @@ class AnalyticsEngine:
 		category: str | None = None,
 		year: str | None = None,
 		city: str | None = None,
+		month: int | str | None = None,
+		customer_segment: str | None = None,
 	) -> list[dict[str, object]]:
-		frame = self.filtered(region=region, category=category, year=year, city=city)
+		frame = self.filtered(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 		if frame.empty:
 			return []
 		result = frame.groupby(["Product ID", "Product Name"], as_index=False).agg(
@@ -384,8 +398,10 @@ class AnalyticsEngine:
 		category: str | None = None,
 		year: str | None = None,
 		city: str | None = None,
+		month: int | str | None = None,
+		customer_segment: str | None = None,
 	) -> list[dict[str, object]]:
-		frame = self.filtered(region=region, category=category, year=year, city=city)
+		frame = self.filtered(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 		if frame.empty:
 			return []
 		result = frame.groupby(["Customer ID", "Customer Name"], dropna=False, as_index=False).agg(
@@ -672,8 +688,10 @@ class AnalyticsEngine:
 		year: str | None = None,
 		limit: int = 20,
 		offset: int = 0,
+		month: int | str | None = None,
+		customer_segment: str | None = None,
 	) -> dict[str, object]:
-		df = self.filtered(region=region, category=category, year=year, city=city)
+		df = self.filtered(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 		if search and search.strip():
 			q = search.strip().lower()
 			cond = (

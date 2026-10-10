@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -181,30 +182,78 @@ except Exception:
     pass
 
 
+PASSWORD_HASH_PREFIX = "scrypt"
+PASSWORD_SCRYPT_N = 2**14
+PASSWORD_SCRYPT_R = 8
+PASSWORD_SCRYPT_P = 1
+PASSWORD_SCRYPT_DKLEN = 64
+
+
 def hash_password(password: str, salt: bytes | None = None) -> str:
-    # Stored directly as plain text without hashing as requested
-    return password
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.scrypt(
+        password.encode(),
+        salt=salt,
+        n=PASSWORD_SCRYPT_N,
+        r=PASSWORD_SCRYPT_R,
+        p=PASSWORD_SCRYPT_P,
+        dklen=PASSWORD_SCRYPT_DKLEN,
+    )
+    return "$".join((
+        PASSWORD_HASH_PREFIX,
+        str(PASSWORD_SCRYPT_N),
+        str(PASSWORD_SCRYPT_R),
+        str(PASSWORD_SCRYPT_P),
+        base64.b64encode(salt).decode(),
+        base64.b64encode(digest).decode(),
+    ))
+
+
+def is_current_password_hash(encoded: str) -> bool:
+    return encoded.startswith(f"{PASSWORD_HASH_PREFIX}$")
 
 
 def verify_password(password: str, encoded: str) -> bool:
     if not encoded:
         return False
-    # Plain text direct comparison
-    if password == encoded:
+    try:
+        parts = encoded.split("$")
+        if len(parts) == 6 and parts[0] == PASSWORD_HASH_PREFIX:
+            _, n_value, r_value, p_value, salt_value, digest_value = parts
+            salt = base64.b64decode(salt_value.encode(), validate=True)
+            expected = base64.b64decode(digest_value.encode(), validate=True)
+            if (
+                int(n_value) != PASSWORD_SCRYPT_N
+                or int(r_value) != PASSWORD_SCRYPT_R
+                or int(p_value) != PASSWORD_SCRYPT_P
+                or len(salt) != 16
+                or len(expected) != PASSWORD_SCRYPT_DKLEN
+            ):
+                return False
+            candidate = hashlib.scrypt(
+                password.encode(),
+                salt=salt,
+                n=PASSWORD_SCRYPT_N,
+                r=PASSWORD_SCRYPT_R,
+                p=PASSWORD_SCRYPT_P,
+                dklen=len(expected),
+            )
+            return hmac.compare_digest(candidate, expected)
+        legacy_raw = base64.b64decode(encoded.encode(), validate=True)
+        if len(legacy_raw) > 16:
+            salt = legacy_raw[:16]
+            expected = legacy_raw[16:]
+            digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=len(expected))
+            if hmac.compare_digest(digest, expected):
+                return True
+    except (ValueError, TypeError, UnicodeEncodeError):
+        pass
+
+    # Accept legacy plaintext credentials only for migration at the next successful login.
+    if hmac.compare_digest(password.encode(), encoded.encode()):
         return True
-    # Allow demo admin to sign in with either demo-password or Shivu@2002
     if encoded in ("demo-password", "Shivu@2002") and password in ("demo-password", "Shivu@2002"):
         return True
-    # Fallback for any existing scrypt hashes
-    try:
-        raw = base64.b64decode(encoded.encode())
-        if len(raw) >= 16:
-            salt = raw[:16]
-            digest = hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1)
-            candidate = base64.b64encode(salt + digest).decode()
-            return hmac.compare_digest(candidate, encoded)
-    except Exception:
-        pass
     return False
 
 
@@ -284,7 +333,7 @@ class RoleUpdateRequest(BaseModel):
 
 
 class InviteUserRequest(BaseModel):
-    email: str
+    email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8)
     role: str = "Viewer"
 
@@ -439,6 +488,8 @@ def login(request: LoginRequest, session: Session = Depends(get_db_session)) -> 
     is_valid = False
     if user and verify_password(request.password, user.password):
         is_valid = True
+        if not is_current_password_hash(user.password):
+            user.password = hash_password(request.password)
     elif email == "demo@example.com" and request.password in ("demo-password", "Shivu@2002"):
         if not user:
             user = create_user(session, email, hash_password(request.password), "Admin")
@@ -665,6 +716,7 @@ def dashboard_kpis(
             "categories": engine.categories,
             "cities": engine.get_cities(region),
             "customer_segments": engine.customer_segments,
+            "years": engine.years,
         },
     }
 
@@ -680,8 +732,8 @@ def sales_daily(region: str | None = None, category: str | None = None, year: st
 
 
 @app.get("/api/sales/daily/report")
-def sales_daily_report(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
-    return engine.daily_performance_report(region, category, year, city)
+def sales_daily_report(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+    return engine.daily_performance_report(region, category, year, city, month, customer_segment)
 
 
 @app.get("/api/sales/daily/forecast")
@@ -708,12 +760,14 @@ def list_sales_records(
     region: str | None = None,
     city: str | None = None,
     year: str | None = None,
+    month: int | None = Query(default=None, ge=1, le=12),
+    customer_segment: str | None = None,
     limit: int = Query(default=20, ge=1, le=500000),
     offset: int = Query(default=0, ge=0),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     return engine.get_sales_records(
-        search=search, category=category, region=region, city=city, year=year, limit=limit, offset=offset
+        search=search, category=category, region=region, city=city, year=year, limit=limit, offset=offset, month=month, customer_segment=customer_segment
     )
 
 
@@ -786,13 +840,13 @@ def refresh_sales_data(
 
 
 @app.get("/api/products/top")
-def products_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
-    return engine.top_products(region=region, category=category, year=year, city=city)
+def products_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    return engine.top_products(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 
 
 @app.get("/api/customers/top")
-def customers_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
-    return engine.customers(region=region, category=category, year=year, city=city)
+def customers_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    return engine.customers(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 
 
 @app.get("/api/recommendations")
@@ -1387,11 +1441,16 @@ def management_invite_user(
     session: Session = Depends(get_db_session),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
-    if user.get("role") not in {"Admin", "Business Manager"}:
+    inviter_role = user.get("role")
+    if inviter_role not in {"Admin", "Business Manager"}:
         raise HTTPException(status_code=403, detail="Admin or Business Manager role required to invite users")
-    new_role = body.role if body.role in VALID_ROLES else "Viewer"
+    new_role = body.role.strip()
+    if new_role not in VALID_ROLES:
+        raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(VALID_ROLES)}")
+    if inviter_role == "Business Manager" and new_role == "Admin":
+        raise HTTPException(status_code=403, detail="Only Admins can invite users with the Admin role")
     email = body.email.strip().lower() if body.email else ""
-    if not email or "@" not in email:
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(status_code=400, detail="A valid email is required")
     from .database import User as DBUser
     existing = get_user_by_email(session, email)
