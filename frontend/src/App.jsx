@@ -336,6 +336,10 @@ export default function App() {
   const [uploadFile, setUploadFile] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [uploadStatus, setUploadStatus] = useState({ type: '', message: '' });
+  const [uploadMode, setUploadMode] = useState('append');
+  const [datasetVersions, setDatasetVersions] = useState([]);
+  const [versionsLoading, setVersionsLoading] = useState(false);
+  const [restoringVersion, setRestoringVersion] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const fileInputRef = useRef(null);
 
@@ -626,6 +630,28 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!authenticated || role !== 'Admin') {
+      setDatasetVersions([]);
+      return;
+    }
+
+    let active = true;
+    setVersionsLoading(true);
+    apiRequest('/api/data/versions', token)
+      .then((result) => {
+        if (active) setDatasetVersions(result.versions || []);
+      })
+      .catch((error) => {
+        if (active) setUploadStatus({ type: 'error', message: `Unable to load saved CSV versions: ${error.message}` });
+      })
+      .finally(() => {
+        if (active) setVersionsLoading(false);
+      });
+
+    return () => { active = false; };
+  }, [authenticated, role, token, dataVersion]);
+
+  useEffect(() => {
     if (!authenticated) return;
 
     const loadBase = async () => {
@@ -790,11 +816,16 @@ export default function App() {
           }
           case 'products':
           case 'geographic': {
-            const [prodData, segData] = await Promise.all([
+            const [prodData, categoryData, segData] = await Promise.all([
               apiRequest(`/api/products/top${query}`, token).catch(() => []),
+              apiRequest(`/api/sales/category${query}`, token).catch(() => []),
               apiRequest(`/api/segments/breakdown${query}`, token).catch(() => null),
             ]);
-            setDashboard((prev) => ({ ...prev, topProducts: prodData || [] }));
+            setDashboard((prev) => ({
+              ...prev,
+              topProducts: prodData || [],
+              categoryPerformance: categoryData || [],
+            }));
             if (segData) {
               setSegments({
                 regions: segData.regions || [],
@@ -1003,11 +1034,13 @@ export default function App() {
             ? ` Sales: ${formatCurrency(ctx.parsed.y ?? ctx.parsed)}`
             : type === 'pie'
               ? ` ${ctx.label}: ${formatCurrency(ctx.parsed)}`
-              : ` Net sales: ${formatCurrency(ctx.parsed.y)}`,
+              : type === 'percentage'
+                ? ` ${ctx.dataset.label}: ${Number(ctx.parsed.y ?? ctx.parsed).toFixed(1)}%`
+                : ` Net sales: ${formatCurrency(ctx.parsed.y)}`,
         },
       },
     },
-    scales: type === 'line' || type === 'bar' ? {
+    scales: type === 'line' || type === 'bar' || type === 'percentage' ? {
       x: {
         grid: { color: 'rgba(255,255,255,0.04)' },
         ticks: { color: '#8fa2b6', maxRotation: 0, autoSkip: true, maxTicksLimit: 10, font: { size: 11 } },
@@ -1019,7 +1052,7 @@ export default function App() {
         ticks: {
           color: '#8fa2b6',
           font: { size: 11 },
-          callback: (value) => formatCurrency(value),
+          callback: (value) => type === 'percentage' ? `${Number(value).toFixed(0)}%` : formatCurrency(value),
         },
         border: { display: false },
       },
@@ -1164,20 +1197,32 @@ export default function App() {
     try {
       const formData = new FormData();
       formData.append('file', uploadFile);
+      formData.append('mode', uploadMode);
       const result = await apiRequest('/api/data/upload', token, {
         method: 'POST',
         body: formData,
       });
+      const importSummary = uploadMode === 'append'
+        ? `Added ${formatNumber(result.added_records || 0)} records; skipped ${formatNumber(result.skipped_duplicates || 0)} duplicate order IDs.`
+        : `Loaded ${formatNumber(result.records_loaded || 0)} records and replaced the active dataset.`;
       setUploadStatus({
-        type: 'success',
-        message: `✅ Uploaded "${result.filename}" successfully. Reloading dashboard…`,
+        type: result.db_synced ? 'success' : 'error',
+        message: `${result.db_synced ? '✅' : '⚠️'} "${result.filename}" ${importSummary}${result.db_synced ? ' Dashboard reloading…' : ` Database sync failed: ${result.db_error || 'unknown error'}`}`,
       });
       setUploadFile(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       setDataVersion((v) => v + 1);
-      setTimeout(() => {
+      if (result.db_synced) setTimeout(() => {
         setUploadStatus({ type: '', message: '' });
       }, 2800);
-      auditLog('data_upload', 'success', { filename: result.filename || uploadFile.name, size: uploadFile.size });
+      auditLog('data_upload', result.db_synced ? 'success' : 'error', {
+        filename: result.filename || uploadFile.name,
+        size: uploadFile.size,
+        mode: uploadMode,
+        added_records: result.added_records,
+        skipped_duplicates: result.skipped_duplicates,
+        db_error: result.db_error,
+      });
     } catch (error) {
       setUploadStatus({
         type: 'error',
@@ -1186,6 +1231,30 @@ export default function App() {
       auditLog('data_upload', 'error', { filename: uploadFile.name, error: error.message || 'Upload failed' });
     } finally {
       setUploading(false);
+    }
+  };
+
+  const handleRestoreVersion = async (version) => {
+    if (restoringVersion || !window.confirm(`Restore "${version.filename}" as the active dataset? The current dataset will remain saved.`)) return;
+    setRestoringVersion(version.id);
+    setUploadStatus({ type: 'info', message: `Restoring "${version.filename}"…` });
+    try {
+      const result = await apiRequest(`/api/data/restore/${encodeURIComponent(version.id)}`, token, { method: 'POST' });
+      setUploadStatus({
+        type: result.db_synced ? 'success' : 'error',
+        message: `${result.db_synced ? '✅' : '⚠️'} Restored "${version.filename}" with ${formatNumber(result.records_loaded || 0)} records.${result.db_synced ? '' : ` Database sync failed: ${result.db_error || 'unknown error'}`}`,
+      });
+      setDataVersion((v) => v + 1);
+      auditLog('data_restore', result.db_synced ? 'success' : 'error', {
+        filename: version.filename,
+        version_id: version.id,
+        db_error: result.db_error,
+      });
+    } catch (error) {
+      setUploadStatus({ type: 'error', message: error.message || 'Unable to restore the saved dataset.' });
+      auditLog('data_restore', 'error', { filename: version.filename, error: error.message || 'Unable to restore dataset' });
+    } finally {
+      setRestoringVersion('');
     }
   };
 
@@ -2517,18 +2586,28 @@ export default function App() {
       }
       case 'products': {
         const prods = dashboard.topProducts || [];
-        const catSales = {};
-        const catReturns = {};
-        const catUnits = {};
-        prods.forEach((p) => {
-          const c = p.Category || 'Uncategorized';
-          catSales[c] = (catSales[c] || 0) + Number(p.sales || 0);
-          catReturns[c] = (catReturns[c] || 0) + Number(p.returns || 0);
-          catUnits[c] = (catUnits[c] || 0) + Number(p.units || 0);
-        });
-        const catLabels = Object.keys(catSales);
-        const catPie = { labels: catLabels, datasets: [{ data: catLabels.map((c) => catSales[c]), backgroundColor: ['#5b8def', '#ff6b35', '#00c2a8', '#ffc857', '#a78bfa', '#f472b6', '#34d399'], borderWidth: 0 }] };
-        const retBars = { labels: catLabels, datasets: [{ label: 'Return Rate %', data: catLabels.map((c) => (100 * (catReturns[c] || 0) / Math.max(1, catUnits[c] || 0))), backgroundColor: '#ff6b35', borderRadius: 8 }] };
+        const categories = dashboard.categoryPerformance || [];
+        const categoryPalette = ['#5b8def', '#ff6b35', '#00c2a8', '#ffc857', '#a78bfa', '#f472b6', '#34d399'];
+        const catLabels = categories.map((category) => category.Category || category.category || 'Uncategorized');
+        const categorySales = categories.map((category) => Number(category.sales || 0));
+        const totalCategorySales = categorySales.reduce((total, sales) => total + sales, 0);
+        const catPie = {
+          labels: catLabels,
+          datasets: [{
+            data: categorySales.map((sales) => totalCategorySales ? (sales / totalCategorySales) * 100 : 0),
+            backgroundColor: catLabels.map((_, index) => categoryPalette[index % categoryPalette.length]),
+            borderWidth: 0,
+          }],
+        };
+        const retBars = {
+          labels: catLabels,
+          datasets: [{
+            label: 'Return Rate',
+            data: categories.map((category) => Number(category.return_rate || 0)),
+            backgroundColor: '#ff6b35',
+            borderRadius: 8,
+          }],
+        };
         const unitsVsSales = {
           labels: prods.slice(0, 15).map((p) => (p['Product Name'] || '').slice(0, 20)),
           datasets: [
@@ -2555,7 +2634,7 @@ export default function App() {
                   <p className="hero-subtitle">{formatNumber(prods.length)} unique products ranked by revenue, units, and margin-adjusted quality.</p>
                 </div>
                 <div className="hero-stats">
-                  <div><strong>{formatNumber(Object.values(catUnits).reduce((a, b) => a + b, 0))}</strong><span>Total Units</span></div>
+                  <div><strong>{formatNumber(prods.reduce((total, product) => total + Number(product.units || 0), 0))}</strong><span>Total Units</span></div>
                   <div className="divider" />
                   <div><strong>{catLabels.length}</strong><span>Categories</span></div>
                   <div className="divider" />
@@ -2564,7 +2643,7 @@ export default function App() {
               </div>
             </section>
             <section className="panel"><div className="panel-head"><div><div className="panel-eyebrow">CATEGORY MIX</div><h2>Revenue Share</h2></div></div><div className="chart-frame"><Doughnut data={catPie} options={doughnutOpts} /></div></section>
-            <section className="panel"><div className="panel-head"><div><div className="panel-eyebrow">QUALITY</div><h2>Return Rate by Category</h2></div></div><div className="chart-frame"><Bar data={retBars} options={chartOpts('bar')} /></div></section>
+            <section className="panel"><div className="panel-head"><div><div className="panel-eyebrow">QUALITY</div><h2>Return Rate by Category</h2></div></div><div className="chart-frame"><Bar data={retBars} options={chartOpts('percentage')} /></div></section>
             <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">COMBO</div><h2>Units Sold vs Revenue (Top 15 SKUs)</h2><p className="panel-subtitle">Bars = sales ₹L · Line = units shipped</p></div></div><div className="chart-frame tall"><Bar data={unitsVsSales} options={uvsOpts} /></div></section>
             <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">RANKING</div><h2>Top Products Detail</h2></div></div>
               <div className="table-wrap">
@@ -2602,13 +2681,21 @@ export default function App() {
         const segAOV = segs.map((s) => Number(s.AOV || s.aov || 0));
         const segCounts = segs.map((s) => Number(s.Customers || s.customers || s.Count || 0));
         const aovBar = { labels: segLabels, datasets: [{ label: 'AOV (₹)', data: segAOV, backgroundColor: ['#5b8def', '#ff6b35', '#00c2a8', '#ffc857', '#a78bfa', '#f472b6'], borderRadius: 8 }] };
-        const segDonut = { labels: segLabels, datasets: [{ data: segCounts.length ? segCounts : cust.map((c) => c['Customer Segment'] || 'Unknown').reduce((acc, v) => (acc[v] = (acc[v] || 0) + 1, acc), {}), backgroundColor: ['#00c2a8', '#5b8def', '#ff6b35', '#ffc857', '#a78bfa', '#f472b6', '#34d399'], borderWidth: 0 }] };
-        const donutLabels = Object.keys((cust.map((c) => c['Customer Segment'] || 'Unknown').reduce((acc, v) => (acc[v] = (acc[v] || 0) + 1, acc), {})));
-        if (segLabels.length === 0 && donutLabels.length) {
-          const counter = cust.map((c) => c['Customer Segment'] || 'Unknown').reduce((acc, v) => (acc[v] = (acc[v] || 0) + 1, acc), {});
-          segDonut.labels = Object.keys(counter);
-          segDonut.datasets[0].data = Object.values(counter);
-        }
+        const customerSegmentCounts = cust.reduce((counts, customer) => {
+          const segment = customer['Customer Segment'] || 'Unknown';
+          counts[segment] = (counts[segment] || 0) + 1;
+          return counts;
+        }, {});
+        const donutLabels = segLabels.length ? segLabels : Object.keys(customerSegmentCounts);
+        const donutValues = segLabels.length ? segCounts : Object.values(customerSegmentCounts);
+        const segDonut = {
+          labels: donutLabels,
+          datasets: [{
+            data: donutValues,
+            backgroundColor: ['#00c2a8', '#5b8def', '#ff6b35', '#ffc857', '#a78bfa', '#f472b6', '#34d399'],
+            borderWidth: 0,
+          }],
+        };
         return (
           <div className="content-grid">
             <section className="panel hero-panel wide" style={{ background: 'linear-gradient(135deg, rgba(167,139,250,0.1), rgba(91,141,239,0.14) 70%)' }}>
@@ -3227,10 +3314,23 @@ export default function App() {
                 <div className="upload-head">
                   <div className="upload-head-text">
                     <div className="panel-eyebrow" style={{ color: '#ffc857' }}>⚡ CSV UPLOAD</div>
-                    <h2>Drop new dataset</h2>
-                    <p className="panel-subtitle">Upload will refresh KPIs, retrain models, sync to MySQL (if connected), and increment data version.</p>
+                    <h2>Import CSV data</h2>
+                    <p className="panel-subtitle">Choose whether to add new orders to the current dataset or replace it entirely.</p>
                   </div>
                 </div>
+                <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14 }}>
+                  <button type="button" className={uploadMode === 'append' ? 'primary-cta' : 'secondary-cta'} onClick={() => setUploadMode('append')}>
+                    Add new records
+                  </button>
+                  <button type="button" className={uploadMode === 'replace' ? 'primary-cta' : 'secondary-cta'} onClick={() => setUploadMode('replace')}>
+                    Replace dataset
+                  </button>
+                </div>
+                <p className="panel-subtitle" style={{ marginBottom: 14 }}>
+                  {uploadMode === 'append'
+                    ? 'Existing records are kept. Rows with an order_id already in the dataset (or repeated in this file) are skipped.'
+                    : 'The uploaded CSV becomes the complete active dataset. The previous dataset is saved so it can be restored.'}
+                </p>
                 <div className={`dropzone ${isDragOver ? 'drag-over' : ''} ${uploadFile ? 'has-file' : ''}`} onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }} onDragLeave={() => setIsDragOver(false)} onDrop={(e) => { e.preventDefault(); setIsDragOver(false); handleFilePick(e.dataTransfer.files); }} onClick={() => fileInputRef.current?.click()}>
                   <input ref={fileInputRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={(e) => handleFilePick(e.target.files)} />
                   {uploadFile ? (
@@ -3269,7 +3369,7 @@ export default function App() {
             )}
             <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">RECENT IMPORT HISTORY</div><h2>Recent Actions</h2></div></div>
               <div className="table-wrap"><table className="styled-table"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Status</th></tr></thead><tbody>
-                {auditEntries.filter((e) => /upload|sync|import/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
+                {auditEntries.filter((e) => /upload|sync|import|restore/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
                   <tr key={`ih-${i}`}>
                     <td>{new Date(e.timestamp).toLocaleString()}</td>
                     <td>{e.actor}</td>
@@ -3277,9 +3377,43 @@ export default function App() {
                     <td><span className={`risk-chip ${e.status === 'success' ? '' : 'high'}`}>{e.status}</span></td>
                   </tr>
                 ))}
-                {!auditEntries.some((e) => /upload|sync|import/i.test(e.action)) && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
+                {!auditEntries.some((e) => /upload|sync|import|restore/i.test(e.action)) && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
               </tbody></table></div>
             </section>
+            {isAdmin && (
+              <section className="panel wide">
+                <div className="panel-head">
+                  <div><div className="panel-eyebrow">RECOVERY</div><h2>Saved CSV versions</h2></div>
+                  {versionsLoading && <span className="muted small">Loading…</span>}
+                </div>
+                <p className="panel-subtitle">Earlier datasets are saved automatically before imports and can be restored at any time.</p>
+                <div className="table-wrap">
+                  <table className="styled-table">
+                    <thead><tr><th>CSV file</th><th>Saved</th><th>Action</th></tr></thead>
+                    <tbody>
+                      {datasetVersions.map((version) => (
+                        <tr key={version.id}>
+                          <td><strong>{version.filename}</strong></td>
+                          <td>{new Date(version.created_at).toLocaleString()}</td>
+                          <td>
+                            <button
+                              className="secondary-cta"
+                              onClick={() => handleRestoreVersion(version)}
+                              disabled={Boolean(restoringVersion)}
+                            >
+                              {restoringVersion === version.id ? 'Restoring…' : 'Restore this CSV'}
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                      {!versionsLoading && datasetVersions.length === 0 && (
+                        <tr><td colSpan={3} className="empty-row">No saved versions yet. The active CSV is saved automatically before the next import.</td></tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+            )}
           </div>
         );
       }

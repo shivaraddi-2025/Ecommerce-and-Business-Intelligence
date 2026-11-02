@@ -7,6 +7,8 @@ import json
 import os
 import re
 import secrets
+import shutil
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -15,7 +17,7 @@ from typing import AsyncIterator, Iterator
 import numpy as np
 import pandas as pd
 
-from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile, status
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -127,6 +129,8 @@ ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "data" / "raw" / "ecommerce_sales_raw.csv"
 LARGE_DATASET = ROOT / "data" / "raw" / "ecommerce_sales_raw.csv.csv"
 ACTIVE_DATASET_FILE = ROOT / "data" / "raw" / ".active_dataset_path.txt"
+DATASET_VERSIONS_DIR = ROOT / "data" / "raw" / "versions"
+DATASET_UPLOADS_DIR = ROOT / "data" / "raw" / "uploads"
 
 VALID_ROLES = {"Admin", "Business Manager", "Analyst", "Viewer"}
 
@@ -155,6 +159,49 @@ def resolve_dataset_path() -> Path:
 
 
 DATASET = resolve_dataset_path()
+
+
+def _archive_active_dataset() -> None:
+    if not DATASET.exists() or DATASET.parent.resolve() == DATASET_VERSIONS_DIR.resolve():
+        return
+
+    DATASET_VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    version_id = uuid.uuid4().hex
+    shutil.copy2(DATASET, DATASET_VERSIONS_DIR / f"{version_id}.csv")
+    metadata = {
+        "filename": DATASET.name,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    (DATASET_VERSIONS_DIR / f"{version_id}.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+
+def _dataset_versions() -> list[dict[str, str]]:
+    versions = []
+    if not DATASET_VERSIONS_DIR.exists():
+        return versions
+
+    for path in DATASET_VERSIONS_DIR.glob("*.csv"):
+        metadata_path = path.with_suffix(".json")
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            metadata = {}
+        versions.append({
+            "id": path.stem,
+            "filename": str(metadata.get("filename") or path.name),
+            "created_at": str(metadata.get("created_at") or datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()),
+        })
+    return sorted(versions, key=lambda version: version["created_at"], reverse=True)
+
+
+def _activate_dataset(dataset_path: Path, dataset_engine: AnalyticsEngine) -> None:
+    global DATASET, engine
+    ACTIVE_DATASET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ACTIVE_DATASET_FILE.write_text(str(dataset_path), encoding="utf-8")
+    os.environ["DATASET_PATH"] = str(dataset_path)
+    DATASET = dataset_path
+    dataset_engine.dataset_path = dataset_path
+    engine = dataset_engine
 
 
 @asynccontextmanager
@@ -911,33 +958,153 @@ def predict(request: PredictionRequest, user: dict[str, str] = Depends(current_u
 
 
 @app.post("/api/data/upload")
-async def upload_dataset(file: UploadFile = File(...), user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+async def upload_dataset(
+    file: UploadFile = File(...),
+    mode: str = Form("replace"),
+    user: dict[str, str] = Depends(current_user),
+) -> dict[str, object]:
     if user.get("role") != "Admin":
         raise HTTPException(status_code=403, detail="Admin role required")
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="CSV file required")
+    if mode not in {"append", "replace"}:
+        raise HTTPException(status_code=400, detail="Import mode must be append or replace")
 
-    global DATASET, engine
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="CSV file is empty")
 
-    target = ROOT / "data" / "raw" / file.filename
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_bytes(await file.read())
+    DATASET_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    upload_id = uuid.uuid4().hex
+    original_filename = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        Path(file.filename.replace("\\", "/")).name,
+    ).strip("._") or "dataset.csv"
+    target = DATASET_UPLOADS_DIR / f"{upload_id}_{original_filename}"
 
-    DATASET = target
-    os.environ["DATASET_PATH"] = str(target)
-    ACTIVE_DATASET_FILE.write_text(str(target))
-    engine = AnalyticsEngine(DATASET)
+    if mode == "append":
+        try:
+            existing = pd.read_csv(DATASET)
+            incoming = pd.read_csv(pd.io.common.BytesIO(content))
+        except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+            raise HTTPException(status_code=422, detail=f"Unable to read CSV data: {exc}") from exc
+
+        if "order_id" not in existing.columns or "order_id" not in incoming.columns:
+            raise HTTPException(status_code=422, detail="Both datasets must contain an order_id column to append.")
+        if set(existing.columns) != set(incoming.columns):
+            missing = sorted(set(existing.columns) - set(incoming.columns))
+            extra = sorted(set(incoming.columns) - set(existing.columns))
+            details = []
+            if missing:
+                details.append(f"missing columns: {', '.join(missing)}")
+            if extra:
+                details.append(f"unexpected columns: {', '.join(extra)}")
+            raise HTTPException(status_code=422, detail=f"CSV columns do not match the current dataset ({'; '.join(details)}).")
+        incoming = incoming.reindex(columns=existing.columns)
+
+        existing_ids = set(existing["order_id"].dropna().astype(str).str.strip().str.casefold())
+        incoming_ids = incoming["order_id"].astype("string").str.strip()
+        if incoming_ids.isna().any() or incoming_ids.eq("").any():
+            raise HTTPException(status_code=422, detail="Every imported row must have an order_id.")
+        duplicate_mask = incoming_ids.str.casefold().duplicated(keep="first") | incoming_ids.str.casefold().isin(existing_ids)
+        additions = incoming.loc[~duplicate_mask].copy()
+        added_records = len(additions)
+        skipped_duplicates = len(incoming) - added_records
+        if not added_records:
+            return {
+                "status": "unchanged",
+                "filename": original_filename,
+                "records_loaded": len(engine.frame),
+                "added_records": 0,
+                "skipped_duplicates": skipped_duplicates,
+                "db_synced": True,
+                "db_counts": {},
+                "db_error": None,
+            }
+
+        combined = pd.concat([existing, additions], ignore_index=True)
+        temporary_path = DATASET_UPLOADS_DIR / f".{upload_id}.tmp.csv"
+        try:
+            combined.to_csv(temporary_path, index=False)
+            dataset_engine = AnalyticsEngine(temporary_path)
+            _archive_active_dataset()
+            os.replace(temporary_path, target)
+        except (OSError, ValueError, pd.errors.ParserError) as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=422, detail=f"Unable to prepare the combined dataset: {exc}") from exc
+        _activate_dataset(target, dataset_engine)
+    else:
+        temporary_path = DATASET_UPLOADS_DIR / f".{upload_id}.tmp.csv"
+        try:
+            temporary_path.write_bytes(content)
+            dataset_engine = AnalyticsEngine(temporary_path)
+            _archive_active_dataset()
+            os.replace(temporary_path, target)
+        except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+            temporary_path.unlink(missing_ok=True)
+            raise HTTPException(status_code=422, detail=f"Unable to load CSV data: {exc}") from exc
+        _activate_dataset(target, dataset_engine)
+        added_records = len(dataset_engine.frame)
+        skipped_duplicates = 0
 
     db_counts: dict[str, int] = {}
     db_error: str | None = None
     try:
-        db_counts = db_sync.sync_csv_to_db(str(target), replace_existing=True)
+        db_counts = db_sync.sync_csv_to_db(str(DATASET), replace_existing=True)
     except Exception as exc:
         db_error = str(exc)
 
     return {
         "status": "uploaded",
-        "filename": file.filename,
+        "filename": original_filename,
+        "records_loaded": len(engine.frame),
+        "added_records": added_records,
+        "skipped_duplicates": skipped_duplicates,
+        "db_synced": db_error is None,
+        "db_counts": db_counts,
+        "db_error": db_error,
+    }
+
+
+@app.get("/api/data/versions")
+def list_dataset_versions(user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+    if user.get("role") != "Admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    return {"versions": _dataset_versions()}
+
+
+@app.post("/api/data/restore/{version_id}")
+def restore_dataset_version(version_id: str, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+    if user.get("role") != "Admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
+    if not re.fullmatch(r"[a-f0-9]{32}", version_id):
+        raise HTTPException(status_code=400, detail="Invalid dataset version")
+
+    version_path = DATASET_VERSIONS_DIR / f"{version_id}.csv"
+    if not version_path.is_file():
+        raise HTTPException(status_code=404, detail="Dataset version not found")
+    try:
+        dataset_engine = AnalyticsEngine(version_path)
+    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to restore dataset version: {exc}") from exc
+
+    try:
+        _archive_active_dataset()
+        _activate_dataset(version_path, dataset_engine)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Unable to activate dataset version: {exc}") from exc
+
+    db_counts: dict[str, int] = {}
+    db_error: str | None = None
+    try:
+        db_counts = db_sync.sync_csv_to_db(str(DATASET), replace_existing=True)
+    except Exception as exc:
+        db_error = str(exc)
+
+    return {
+        "status": "restored",
+        "filename": version_path.name,
         "records_loaded": len(engine.frame),
         "db_synced": db_error is None,
         "db_counts": db_counts,
