@@ -77,6 +77,7 @@ class User(Base):
     phone = Column(String(32), nullable=True, index=True)
     password = Column(String(512), nullable=False)
     role = Column(String(64), nullable=False, default="Viewer")
+    branch = Column(String(80), nullable=True)
     otp_code = Column(String(16), nullable=True)
     otp_expires_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -87,6 +88,7 @@ class User(Base):
             "email": self.email,
             "phone": self.phone or "",
             "role": self.role or "Viewer",
+            "branch": self.branch or "",
         }
 
 
@@ -204,7 +206,12 @@ def init_db() -> None:
     Base.metadata.create_all(bind=engine)
     try:
         with engine.begin() as conn:
-            for col, col_type in [("phone", "VARCHAR(32)"), ("otp_code", "VARCHAR(16)"), ("otp_expires_at", "DATETIME")]:
+            for col, col_type in [
+                ("phone", "VARCHAR(32)"),
+                ("otp_code", "VARCHAR(16)"),
+                ("otp_expires_at", "DATETIME"),
+                ("branch", "VARCHAR(80)"),
+            ]:
                 try:
                     conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {col_type}"))
                 except Exception:
@@ -246,12 +253,14 @@ def create_user(
     hashed_password: str,
     role: str = "Viewer",
     phone: str | None = None,
+    branch: str | None = None,
 ) -> User:
     user = User(
         email=email.strip().lower(),
         phone=phone.strip() if phone else None,
         password=hashed_password,
         role=role,
+        branch=branch.strip() if branch else None,
     )
     session.add(user)
     session.flush()

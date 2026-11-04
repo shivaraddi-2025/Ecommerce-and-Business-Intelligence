@@ -156,3 +156,4 @@ All 11 tests should pass.
 - **Size**: 80,000 orders
 - **Columns**: Order ID, Order Date, Customer, Product, Category, Region, City, Sales, Profit, Discount, Quantity
 - **Note**: Profit is estimated at a 30% margin (no cost data in the source)
+- Uploaded datasets remain active after restarting the backend. The backend reloads the saved active dataset path before falling back to `DATASET_PATH` or the default CSV.

@@ -160,6 +160,7 @@ async function apiRequest(path, token, options = {}, returnBlob = false) {
 
   const response = await fetch(`${API_BASE}${path}`, {
     ...options,
+    cache: options.cache || 'no-store',
     headers,
   });
 
@@ -195,6 +196,7 @@ function auditLog(action, status = 'success', extra = {}) {
     const entry = {
       timestamp: new Date().toISOString(),
       actor: localStorage.getItem('nexus_role') || 'Viewer',
+      branch: localStorage.getItem('nexus_branch') || '',
       action,
       status,
       ...extra,
@@ -283,10 +285,16 @@ export default function App() {
   const [token, setToken] = useState(localStorage.getItem('nexus_token') || '');
   const [role, setRole] = useState(localStorage.getItem('nexus_role') || 'Viewer');
   const [activeView, setActiveView] = useState('overview');
-  const [filters, setFilters] = useState(defaultFilters);
+  const [filters, setFilters] = useState(() => {
+    const storedRole = localStorage.getItem('nexus_role') || 'Viewer';
+    const branchCity = localStorage.getItem('nexus_branch') || '';
+    return ['Manager', 'Business Manager'].includes(storedRole)
+      ? { ...defaultFilters, city: branchCity }
+      : defaultFilters;
+  });
   const [exportYear, setExportYear] = useState('');
   const [exportMonth, setExportMonth] = useState('');
-  const [meta, setMeta] = useState({ regions: [], categories: [], cities: [], customer_segments: [], years: [] });
+  const [meta, setMeta] = useState({ regions: [], categories: [], cities: [], city_regions: {}, customer_segments: [], years: [] });
   const [dashboard, setDashboard] = useState({
     kpis: {},
     trend: [],
@@ -361,7 +369,8 @@ export default function App() {
   const [syncStatus, setSyncStatus] = useState({ type: '', message: '' });
   const [usersList, setUsersList] = useState(null);
   const [usersEdit, setUsersEdit] = useState({});
-  const [inviteForm, setInviteForm] = useState({ email: '', password: '', role: 'Viewer' });
+  const [userBranchEdit, setUserBranchEdit] = useState({});
+  const [inviteForm, setInviteForm] = useState({ email: '', password: '', role: 'Viewer', branch: '' });
   const [showInvitePassword, setShowInvitePassword] = useState(false);
   const [inviteStatus, setInviteStatus] = useState({ type: '', message: '' });
   const [usersSaving, setUsersSaving] = useState({});
@@ -602,12 +611,31 @@ export default function App() {
 
 
   const authenticated = Boolean(token);
+  const isAdmin = role === 'Admin';
+  const isManager = role === 'Manager' || role === 'Business Manager';
+  const canManageSales = isAdmin;
+  const canDeleteSales = isAdmin || isManager;
+  const canUploadDatasets = isAdmin || isManager || role === 'Analyst';
+  const canManageUsers = isAdmin;
+  const canViewAudit = isAdmin || isManager;
+  const canAccessView = (view) => {
+    if (['users', 'settings', 'database'].includes(view)) return isAdmin;
+    if (view === 'audit') return canViewAudit;
+    if (view === 'dataimport') return canUploadDatasets;
+    return true;
+  };
   const loading = baseLoading || viewLoading;
   const activeFilterCount = [filters.region, filters.city, filters.category, filters.customer_segment, filters.year].filter(Boolean).length;
   const auditEntries = useMemo(() => getAuditEvents(), [auditRevision]);
   const cacheKey = useMemo(() => JSON.stringify(filters) + '|' + dataVersion, [filters, dataVersion]);
   const viewKey = useMemo(() => cacheKey + '|v' + (viewRefresh[activeView] || 0), [cacheKey, viewRefresh, activeView]);
   const isViewFresh = viewLoadedAt[activeView] === viewKey;
+
+  useEffect(() => {
+    if (!canAccessView(activeView)) {
+      setActiveView('overview');
+    }
+  }, [activeView, role]);
 
   useEffect(() => {
     const handleUnauthorized = () => {
@@ -671,11 +699,19 @@ export default function App() {
         setMeta((prev) => ({
           ...prev,
           regions: kpisData.filters?.regions || [],
+          city_regions: kpisData.filters?.city_regions || {},
           categories: kpisData.filters?.categories || [],
           cities: kpisData.filters?.cities || [],
           customer_segments: kpisData.filters?.customer_segments || ['Loyal', 'New', 'Returning'],
           years: kpisData.filters?.years || prev.years,
         }));
+        if (['Manager', 'Business Manager'].includes(role)) {
+          const assignedRegion = kpisData.filters?.regions?.[0] || '';
+          const assignedCity = kpisData.filters?.cities?.[0] || '';
+          setFilters((prev) => prev.region === assignedRegion && prev.city === assignedCity
+            ? prev
+            : { ...prev, region: assignedRegion, city: assignedCity });
+        }
         setViewLoadedAt({});
         setStatus('Filters ready · choose a section below');
       } catch (error) {
@@ -879,7 +915,7 @@ export default function App() {
             break;
           }
           case 'users': {
-            if (role === 'Admin' || role === 'Business Manager') {
+            if (role === 'Admin') {
               const ul = await apiRequest('/api/management/users', token).catch(() => null);
               setUsersList(ul);
             }
@@ -1124,8 +1160,14 @@ export default function App() {
       });
       localStorage.setItem('nexus_token', result.access_token);
       localStorage.setItem('nexus_role', result.role || 'Viewer');
+      localStorage.setItem('nexus_email', loginForm.email.trim().toLowerCase());
+      if (result.branch) localStorage.setItem('nexus_branch', result.branch);
+      else localStorage.removeItem('nexus_branch');
       setToken(result.access_token);
       setRole(result.role || 'Viewer');
+      setFilters(['Manager', 'Business Manager'].includes(result.role)
+        ? { ...defaultFilters, region: result.region || '', city: result.city || '' }
+        : defaultFilters);
       setLoginError('');
       auditLog('login', 'success', { email: loginForm.email, role: result.role || 'Viewer' });
     } catch (error) {
@@ -1141,6 +1183,7 @@ export default function App() {
   const logout = () => {
     localStorage.removeItem('nexus_token');
     localStorage.removeItem('nexus_role');
+    localStorage.removeItem('nexus_branch');
     setToken('');
     setRole('Viewer');
     setFilters(defaultFilters);
@@ -1171,6 +1214,7 @@ export default function App() {
       const response = await apiRequest(endpoint, token, { method, body: payload ? JSON.stringify(payload) : undefined });
       setStatus(`${response.status || 'done'}: ${response.name || successText}`);
       setAdminForm({ region: '', category: '' });
+      setDataVersion((version) => version + 1);
     } catch (error) {
       setStatus(error.message || 'Admin action failed');
     }
@@ -1226,7 +1270,7 @@ export default function App() {
     } catch (error) {
       setUploadStatus({
         type: 'error',
-        message: error.message || 'Upload failed. Only Admins can upload data.',
+        message: error.message || 'Upload failed. Check your role and branch assignment.',
       });
       auditLog('data_upload', 'error', { filename: uploadFile.name, error: error.message || 'Upload failed' });
     } finally {
@@ -2098,10 +2142,10 @@ export default function App() {
               <div className="panel-head">
                 <div>
                   <div className="panel-eyebrow" style={{ color: '#00c2a8' }}>DATA OPERATIONS & LIVE RECORDS</div>
-                  <h2>Sales Data Management</h2>
-                  <p className="panel-subtitle">Record new sales transactions, modify existing orders, or sync and recalculate all pipeline statistics.</p>
+                  <h2>{canManageSales ? 'Sales Data Management' : 'Sales Records'}</h2>
+                  <p className="panel-subtitle">{canManageSales ? 'Record new sales transactions, modify existing orders, or sync and recalculate all pipeline statistics.' : 'View sales records. Sales changes are restricted to users with an elevated role.'}</p>
                 </div>
-                <div className="sales-head-actions">
+                {canManageSales && <div className="sales-head-actions">
                   <button
                     className="primary-cta small"
                     onClick={() => {
@@ -2131,7 +2175,7 @@ export default function App() {
                   >
                     <span className={refreshingAll ? 'icon-spin spinning' : ''}>⚡</span> {refreshingAll ? 'Recalculating…' : 'Update & Refresh All'}
                   </button>
-                </div>
+                </div>}
               </div>
 
               {/* Table search & count controls */}
@@ -2182,20 +2226,20 @@ export default function App() {
                       <th>Discount</th>
                       <th>Profit</th>
                       <th>Status</th>
-                      <th style={{ textAlign: 'center' }}>Actions</th>
+                      {canDeleteSales && <th style={{ textAlign: 'center' }}>Actions</th>}
                     </tr>
                   </thead>
                   <tbody>
                     {salesLoading ? (
                       <tr>
-                        <td colSpan="12" style={{ textAlign: 'center', padding: '24px' }}>
+                        <td colSpan={canManageSales ? 12 : 11} style={{ textAlign: 'center', padding: '24px' }}>
                           <span className="icon-spin spinning" style={{ marginRight: 8 }}>⏳</span> Loading live sales records…
                         </td>
                       </tr>
                     ) : salesRecords.length === 0 ? (
                       <tr>
-                        <td colSpan="12" style={{ textAlign: 'center', padding: '24px', color: 'var(--muted)' }}>
-                          No sales records matching your query. Click <strong>"➕ Record New Sale"</strong> to add one!
+                        <td colSpan={canManageSales ? 12 : 11} style={{ textAlign: 'center', padding: '24px', color: 'var(--muted)' }}>
+                          No sales records matching your query.{canManageSales && <> Click <strong>"➕ Record New Sale"</strong> to add one!</>}
                         </td>
                       </tr>
                     ) : (
@@ -2223,14 +2267,14 @@ export default function App() {
                               {item.order_status || 'Delivered'}
                             </span>
                           </td>
-                          <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
-                            <button
+                          {canDeleteSales && <td style={{ textAlign: 'center', whiteSpace: 'nowrap' }}>
+                            {isAdmin && <button
                               className="edit-row-btn"
                               title="Update this sale record"
                               onClick={() => handleEditRecord(item)}
                             >
                               ✏️ Edit
-                            </button>
+                            </button>}
                             <button
                               className="del-row-btn"
                               title="Delete record"
@@ -2238,7 +2282,7 @@ export default function App() {
                             >
                               🗑️
                             </button>
-                          </td>
+                          </td>}
                         </tr>
                       ))
                     )}
@@ -3290,15 +3334,19 @@ export default function App() {
         );
       }
       case 'dataimport': {
+        if (!canUploadDatasets) return null;
         const isAdmin = role === 'Admin';
+        const isManager = role === 'Manager' || role === 'Business Manager';
+        const importHistory = auditEntries.filter((entry) => /upload|sync|import|restore/i.test(entry.action)
+          && (!isManager || (entry.action === 'data_upload' && entry.branch === localStorage.getItem('nexus_branch'))));
         return (
           <div className="content-grid">
             <section className="panel hero-panel wide" style={{ background: 'linear-gradient(135deg, rgba(255,200,87,0.1), rgba(255,107,53,0.14) 70%)' }}>
               <div className="hero-inner">
                 <div>
                   <div className="hero-badge"><Icon name="spark" /> DATA IMPORT CENTER</div>
-                  <h1 className="hero-title">{isAdmin ? 'Upload a new CSV dataset to refresh the entire platform' : 'Data import is available for Administrators'}</h1>
-                  <p className="panel-subtitle">Files must contain: <code>order_id, order_date, customer_id, product_category, product_name, quantity, net_amount, region, order_status</code>.</p>
+                  <h1 className="hero-title">{isAdmin ? 'Upload a CSV dataset for the entire platform' : isManager ? `Upload data for ${localStorage.getItem('nexus_branch') || 'your assigned branch'}` : 'Upload a CSV dataset'}</h1>
+                  <p className="panel-subtitle">Files must contain: <code>order_id, order_date, customer_id, product_category, product_name, quantity, net_amount, city, region, order_status</code>. Manager uploads must match their assigned city and its mapped region.</p>
                 </div>
                 <div className="hero-stats">
                   <div><strong>{formatNumber(dashboard.quality.records || 0)}</strong><span>Current Rows</span></div>
@@ -3309,7 +3357,7 @@ export default function App() {
                 </div>
               </div>
             </section>
-            {isAdmin ? (
+            {canUploadDatasets && (
               <section className="panel upload-panel wide">
                 <div className="upload-head">
                   <div className="upload-head-text">
@@ -3329,7 +3377,9 @@ export default function App() {
                 <p className="panel-subtitle" style={{ marginBottom: 14 }}>
                   {uploadMode === 'append'
                     ? 'Existing records are kept. Rows with an order_id already in the dataset (or repeated in this file) are skipped.'
-                    : 'The uploaded CSV becomes the complete active dataset. The previous dataset is saved so it can be restored.'}
+                    : isManager
+                      ? 'Replace records only in your assigned branch; records in other branches are preserved.'
+                      : 'The uploaded CSV becomes the complete active dataset. The previous dataset is saved so it can be restored.'}
                 </p>
                 <div className={`dropzone ${isDragOver ? 'drag-over' : ''} ${uploadFile ? 'has-file' : ''}`} onDragOver={(e) => { e.preventDefault(); setIsDragOver(true); }} onDragLeave={() => setIsDragOver(false)} onDrop={(e) => { e.preventDefault(); setIsDragOver(false); handleFilePick(e.dataTransfer.files); }} onClick={() => fileInputRef.current?.click()}>
                   <input ref={fileInputRef} type="file" accept=".csv,text/csv" style={{ display: 'none' }} onChange={(e) => handleFilePick(e.target.files)} />
@@ -3364,12 +3414,10 @@ export default function App() {
                   </div>
                 )}
               </section>
-            ) : (
-              <section className="panel wide"><div className="panel-head"><div><h2>🔒 Admin access required</h2><p className="panel-subtitle">Contact your workspace Administrator to import datasets.</p></div></div></section>
             )}
-            <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">RECENT IMPORT HISTORY</div><h2>Recent Actions</h2></div></div>
+            {(isAdmin || isManager) && <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">RECENT IMPORT HISTORY</div><h2>Recent Actions</h2></div></div>
               <div className="table-wrap"><table className="styled-table"><thead><tr><th>When</th><th>Actor</th><th>Action</th><th>Status</th></tr></thead><tbody>
-                {auditEntries.filter((e) => /upload|sync|import|restore/i.test(e.action)).slice().reverse().slice(0, 10).map((e, i) => (
+                {importHistory.slice().reverse().slice(0, 10).map((e, i) => (
                   <tr key={`ih-${i}`}>
                     <td>{new Date(e.timestamp).toLocaleString()}</td>
                     <td>{e.actor}</td>
@@ -3377,9 +3425,9 @@ export default function App() {
                     <td><span className={`risk-chip ${e.status === 'success' ? '' : 'high'}`}>{e.status}</span></td>
                   </tr>
                 ))}
-                {!auditEntries.some((e) => /upload|sync|import|restore/i.test(e.action)) && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
+                {importHistory.length === 0 && <tr><td colSpan={4} className="empty-row">No recent import activity.</td></tr>}
               </tbody></table></div>
-            </section>
+            </section>}
             {isAdmin && (
               <section className="panel wide">
                 <div className="panel-head">
@@ -3558,7 +3606,10 @@ export default function App() {
         );
       }
       case 'audit': {
-        const rows = [...auditEntries].reverse();
+        if (!canViewAudit) return null;
+        const rows = [...auditEntries]
+          .filter((entry) => !isManager || (entry.action === 'data_upload' && entry.branch === localStorage.getItem('nexus_branch')))
+          .reverse();
         const clear = () => {
           if (role !== 'Admin') return;
           try {
@@ -3606,8 +3657,8 @@ export default function App() {
         );
       }
       case 'users': {
-        const elevated = role === 'Admin' || role === 'Business Manager';
-        const isAdmin = role === 'Admin';
+        if (!canManageUsers) return null;
+        const elevated = isAdmin;
         const currentEmail = String(localStorage.getItem('nexus_email') || '').toLowerCase();
         const raw = usersList || {};
         const list = Array.isArray(raw.records) ? raw.records : (Array.isArray(raw.users) ? raw.users : (Array.isArray(raw.list) ? raw.list : (Array.isArray(usersList) ? usersList : [])));
@@ -3621,7 +3672,8 @@ export default function App() {
               return acc;
             }, {});
         const roleColor = (r) => { const s = String(r || '').toLowerCase(); if (s.includes('admin')) return '#a78bfa'; if (s.includes('business') || s.includes('manager')) return '#5b8def'; if (s.includes('analyst')) return '#00c2a8'; return '#94a3b8'; };
-        const ROLES = ['Admin', 'Business Manager', 'Analyst', 'Viewer'];
+        const ROLES = ['Admin', 'Manager', 'Analyst', 'Viewer'];
+        const isManagerRole = (value) => value === 'Manager' || value === 'Business Manager';
         const refreshUsers = async () => {
           try {
             const ul = await apiRequest('/api/management/users', token);
@@ -3633,16 +3685,23 @@ export default function App() {
           }
         };
         const saveRole = async (u) => {
-          const patchRole = usersEdit[u.id] && ROLES.includes(usersEdit[u.id]) ? usersEdit[u.id] : null;
-          if (!patchRole || patchRole === u.role) {
+          const patchRole = usersEdit[u.id] || u.role || 'Viewer';
+          const patchBranch = userBranchEdit[u.id] ?? u.branch_city ?? '';
+          if (!ROLES.includes(patchRole)) {
             setUsersEdit((prev) => { const copy = { ...prev }; delete copy[u.id]; return copy; });
+            return;
+          }
+          if (patchRole === u.role && patchBranch === (u.branch_city || '')) {
+            setUsersEdit((prev) => { const copy = { ...prev }; delete copy[u.id]; return copy; });
+            setUserBranchEdit((prev) => { const copy = { ...prev }; delete copy[u.id]; return copy; });
             return;
           }
           try {
             setUsersSaving((prev) => ({ ...prev, [u.id]: 'saving' }));
-            await apiRequest(`/api/management/users/${u.id}/role`, token, { method: 'PATCH', body: JSON.stringify({ role: patchRole }) });
+            await apiRequest(`/api/management/users/${u.id}/role`, token, { method: 'PATCH', body: JSON.stringify({ role: patchRole, branch: patchBranch || null }) });
             setUsersEdit((prev) => { const copy = { ...prev }; delete copy[u.id]; return copy; });
-            setStatus(`${u.email} role updated to ${patchRole}`);
+            setUserBranchEdit((prev) => { const copy = { ...prev }; delete copy[u.id]; return copy; });
+            setStatus(`${u.email} access updated`);
             await refreshUsers();
           } catch (err) {
             setStatus(err.message || 'Failed to update role');
@@ -3680,9 +3739,9 @@ export default function App() {
             setInviteStatus({ type: 'info', message: 'Creating the user account…' });
             const created = await apiRequest('/api/management/users/invite', token, {
               method: 'POST',
-              body: JSON.stringify({ email, password: inviteForm.password, role: inviteForm.role || 'Viewer' }),
+              body: JSON.stringify({ email, password: inviteForm.password, role: inviteForm.role || 'Viewer', branch: inviteForm.branch || null }),
             });
-            setInviteForm({ email: '', password: '', role: 'Viewer' });
+            setInviteForm({ email: '', password: '', role: 'Viewer', branch: '' });
             setShowInvitePassword(false);
             setInviteStatus({
               type: 'success',
@@ -3708,7 +3767,7 @@ export default function App() {
                 <div>
                   <div className="hero-badge"><Icon name="spark" /> USERS &amp; ROLES</div>
                   <h1 className="hero-title">{elevated ? 'Workspace membership and role assignments' : 'User visibility limited to Admins and Business Managers'}</h1>
-                  <p className="panel-subtitle">Roles: <span style={{ color: '#a78bfa' }}>Admin</span> · <span style={{ color: '#5b8def' }}>Business Manager</span> · <span style={{ color: '#00c2a8' }}>Analyst</span> · <span style={{ color: '#94a3b8' }}>Viewer</span></p>
+                  <p className="panel-subtitle">Roles: <span style={{ color: '#a78bfa' }}>Admin</span> · <span style={{ color: '#5b8def' }}>Manager</span> · <span style={{ color: '#00c2a8' }}>Analyst</span> · <span style={{ color: '#94a3b8' }}>Viewer</span></p>
                 </div>
                 <div className="hero-stats">
                   <div><strong>{formatNumber(total || Object.values(byRole).reduce((a, b) => a + b, 0))}</strong><span>Total Users</span></div>
@@ -3740,9 +3799,17 @@ export default function App() {
                     <div className="field" style={{ marginTop: 4 }}>
                       <label>Role</label>
                       <select value={inviteForm.role || 'Viewer'} onChange={(e) => setInviteForm((p) => ({ ...p, role: e.target.value }))}>
-                        {ROLES.filter((rr) => isAdmin || rr !== 'Admin').map((rr) => <option key={rr} value={rr}>{rr}</option>)}
+                        {ROLES.map((rr) => <option key={rr} value={rr}>{rr}</option>)}
                       </select>
                     </div>
+                    {isManagerRole(inviteForm.role) && <div className="field" style={{ marginTop: 4 }}>
+                      <label>Assigned city / place</label>
+                      <select required value={inviteForm.branch} onChange={(e) => setInviteForm((p) => ({ ...p, branch: e.target.value }))}>
+                        <option value="">Select a city / place</option>
+                        {meta.cities.map((city) => <option key={city} value={city}>{city}</option>)}
+                      </select>
+                      {inviteForm.branch && <div className="muted small">Region applied automatically: {meta.city_regions[inviteForm.branch] || 'Unavailable'}</div>}
+                    </div>}
                     {inviteStatus.message && (
                       <div className={`status-alert ${inviteStatus.type}`} role="status" aria-live="polite">
                         {inviteStatus.type === 'success' ? '✅ ' : inviteStatus.type === 'error' ? '⚠️ ' : 'ℹ️ '}
@@ -3756,12 +3823,13 @@ export default function App() {
                   </form>
                 </section>
                 <section className="panel wide"><div className="panel-head"><div><div className="panel-eyebrow">DIRECTORY</div><h2>All Users</h2><div className="panel-subtitle" style={{ marginTop: 4 }}>{isAdmin ? 'Click a ROLE badge to edit it, then save. Remove users with the 🗑️ action. You cannot edit or delete yourself.' : 'Only Admins can change roles and delete users.'}</div></div><span className="badge-good">{formatNumber(total || list.length)} members</span></div>
-                  <div className="table-wrap"><table className="styled-table"><thead><tr><th>#</th><th>Email</th><th>Role</th><th>Created</th><th style={{ width: 180 }}>Actions</th></tr></thead><tbody>
+                  <div className="table-wrap"><table className="styled-table"><thead><tr><th>#</th><th>Email</th><th>Role</th><th>Assigned city / place</th><th>Region</th><th>Created</th><th style={{ width: 180 }}>Actions</th></tr></thead><tbody>
                     {list.map((u, i) => {
                       const isSelf = String(u.email || '').toLowerCase() === currentEmail;
                       const savingState = usersSaving[u.id];
                       const editing = Object.prototype.hasOwnProperty.call(usersEdit, u.id);
                       const roleValue = editing ? (usersEdit[u.id] || u.role) : (u.role || u.Role || 'Viewer');
+                      const branchValue = userBranchEdit[u.id] ?? u.branch_city ?? '';
                       const color = roleColor(roleValue);
                       return (
                         <tr key={`u-${i}-${u.id || u.email}`}>
@@ -3770,13 +3838,9 @@ export default function App() {
                           <td>
                             {editing && isAdmin && !isSelf ? (
                               <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                                <select value={roleValue} onChange={(e) => setUsersEdit((p) => ({ ...p, [u.id]: e.target.value }))}>
+                                <select value={roleValue} onChange={(e) => { setUsersEdit((p) => ({ ...p, [u.id]: e.target.value })); if (!isManagerRole(e.target.value)) setUserBranchEdit((p) => ({ ...p, [u.id]: '' })); }}>
                                   {ROLES.map((rr) => <option key={rr} value={rr}>{rr}</option>)}
                                 </select>
-                                <button className="cta-primary" style={{ padding: '6px 10px', fontSize: 12 }} onClick={() => saveRole(u)} disabled={savingState === 'saving'}>
-                                  {savingState === 'saving' ? 'Saving…' : 'Save'}
-                                </button>
-                                <button className="cta-secondary" style={{ padding: '6px 10px', fontSize: 12 }} onClick={() => setUsersEdit((p) => { const copy = { ...p }; delete copy[u.id]; return copy; })}>Cancel</button>
                               </div>
                             ) : (
                               <span
@@ -3787,11 +3851,27 @@ export default function App() {
                               >{roleValue}</span>
                             )}
                           </td>
+                          <td>
+                            {editing && isAdmin && !isSelf && isManagerRole(roleValue) ? (
+                              <select required value={branchValue} onChange={(e) => setUserBranchEdit((p) => ({ ...p, [u.id]: e.target.value }))}>
+                                <option value="">Select a city / place</option>
+                                {meta.cities.map((city) => <option key={city} value={city}>{city}</option>)}
+                              </select>
+                            ) : (u.branch_city || (u.branch ? `${u.branch} (legacy region assignment)` : '—'))}
+                          </td>
+                          <td>{editing && isManagerRole(roleValue)
+                            ? (meta.city_regions[branchValue] || 'Select a city to derive region')
+                            : (u.branch_region || '—')}</td>
                           <td className="muted small">{u.created_at || u.CreatedAt || u['Created At'] || '—'}</td>
                           <td style={{ textAlign: 'right' }}>
                             {isAdmin && !isSelf ? (
-                              <button className="cta-secondary" style={{ padding: '6px 10px', fontSize: 12, color: '#ff6b35', borderColor: 'rgba(255,107,53,0.35)' }} onClick={() => deleteUser(u)} disabled={savingState === 'deleting'}>
-                                {savingState === 'deleting' ? 'Deleting…' : '🗑️ Remove'}
+                              editing ? <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 6 }}>
+                                <button className="cta-primary" style={{ padding: '6px 10px', fontSize: 12 }} onClick={() => saveRole(u)} disabled={savingState === 'saving'}>
+                                  {savingState === 'saving' ? 'Saving…' : 'Save'}
+                                </button>
+                                <button className="cta-secondary" style={{ padding: '6px 10px', fontSize: 12 }} onClick={() => { setUsersEdit((p) => { const copy = { ...p }; delete copy[u.id]; return copy; }); setUserBranchEdit((p) => { const copy = { ...p }; delete copy[u.id]; return copy; }); }}>Cancel</button>
+                              </div> : <button className="cta-secondary" style={{ padding: '6px 10px', fontSize: 12, color: '#ff6b35', borderColor: 'rgba(255,107,53,0.35)' }} onClick={() => { setUsersEdit((p) => ({ ...p, [u.id]: u.role || 'Viewer' })); setUserBranchEdit((p) => ({ ...p, [u.id]: u.branch_city || '' })); }} disabled={savingState === 'deleting'}>
+                                Edit
                               </button>
                             ) : (
                               <span className="muted small">—</span>
@@ -3800,7 +3880,7 @@ export default function App() {
                         </tr>
                       );
                     })}
-                    {list.length === 0 && <tr><td colSpan={5} className="empty-row">⚙️ Loading or no users returned.</td></tr>}
+                    {list.length === 0 && <tr><td colSpan={7} className="empty-row">⚙️ Loading or no users returned.</td></tr>}
                   </tbody></table></div>
                 </section>
               </>
@@ -3814,6 +3894,7 @@ export default function App() {
         );
       }
       case 'settings': {
+        if (!isAdmin) return null;
         const saveSettings = (patch) => {
           const next = { ...appSettings, ...patch };
           setAppSettings(next);
@@ -3852,6 +3933,13 @@ export default function App() {
                   <small>Click to toggle between light and dark</small>
                 </button>
               </div>
+            </section>
+            <section className="panel wide">
+              <div className="panel-head"><div><div className="panel-eyebrow">BRANCH MANAGEMENT</div><h2>City / place branches</h2><p className="panel-subtitle">Manager branches use cities from the active dataset. Their sales region is derived automatically from each city.</p></div></div>
+              <div className="table-wrap"><table className="styled-table"><thead><tr><th>City / place</th><th>Automatically assigned region</th></tr></thead><tbody>
+                {meta.cities.map((city) => <tr key={city}><td><strong>{city}</strong></td><td>{meta.city_regions[city] || 'No unique region mapping'}</td></tr>)}
+                {meta.cities.length === 0 && <tr><td colSpan={2} className="empty-row">No city / place data available.</td></tr>}
+              </tbody></table></div>
             </section>
             <section className="panel">
               <div className="panel-head"><div><div className="panel-eyebrow">FORECASTING</div><h2>Default Forecast Horizon</h2></div></div>
@@ -4047,11 +4135,14 @@ export default function App() {
           </div>
         </div>
         <div className="sidebar-scroll">
-          {navGroups.map((group) => (
+          {navGroups.map((group) => {
+          const visibleItems = group.items.filter((item) => canAccessView(item.key));
+            if (visibleItems.length === 0) return null;
+            return (
             <div key={group.label}>
               <div className="nav-label">{group.label}</div>
             <nav>
-              {group.items.map((item) => (
+              {visibleItems.map((item) => (
                 <button key={item.key} className={item.key === activeView ? 'active' : ''} onClick={() => {
                   if (item.key !== activeView) auditLog('view_access', 'success', { details: item.label });
                   setActiveView(item.key);
@@ -4062,7 +4153,7 @@ export default function App() {
               ))}
             </nav>
           </div>
-          ))}
+          );})}
         </div>
         <div className="sidebar-footer">
           <div className="footer-stat">
@@ -4082,7 +4173,7 @@ export default function App() {
             <h1>{activeView === 'overview' ? 'Good day, decision maker 👋' : VIEW_LABELS[activeView] || activeView}</h1>
           </div>
           <div className="topbar-controls">
-            <button
+            {canManageSales && <button
               className="action-btn-pill refresh-btn"
               title="Refresh and recalculate all sales data and models"
               onClick={handleRefreshAll}
@@ -4090,8 +4181,8 @@ export default function App() {
             >
               <span className={`icon-spin ${refreshingAll ? 'spinning' : ''}`}>🔄</span>
               <span>{refreshingAll ? 'Refreshing…' : 'Refresh All Data'}</span>
-            </button>
-            <button
+            </button>}
+            {canManageSales && <button
               className="action-btn-pill primary-pill"
               title="Add or update a sales transaction"
               onClick={() => {
@@ -4102,7 +4193,7 @@ export default function App() {
               }}
             >
               <span>➕ Update / Add Sale</span>
-            </button>
+            </button>}
             <div className="user-chip">
               <span className="chip-icon">🗄️</span>
               Live dataset · <strong>{formatNumber(dashboard.quality.records || 0)}</strong> rows
@@ -4254,7 +4345,7 @@ export default function App() {
         {renderView()}
 
         {/* Sales Create / Update Modal Dialog */}
-        {salesModalOpen && (
+        {salesModalOpen && canManageSales && (
           <div className="modal-overlay" onClick={() => setSalesModalOpen(false)}>
             <div className="sales-modal" onClick={(e) => e.stopPropagation()}>
               <div className="modal-header">

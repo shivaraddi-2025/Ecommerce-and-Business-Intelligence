@@ -116,15 +116,6 @@ class AnalyticsEngine:
 		return normalized
 
 	def _load_daily_dataset(self) -> pd.DataFrame:
-		candidate = Path('data/raw/daily_sales_dataset.csv')
-		if candidate.exists():
-			try:
-				frame = pd.read_csv(candidate)
-				frame['Order Date'] = pd.to_datetime(frame['Order Date'], errors='coerce')
-				return frame.sort_values('Order Date').reset_index(drop=True)
-			except Exception:
-				pass
-
 		daily = self.frame.assign(
 			_order_date=pd.to_datetime(self.frame["Order Date"], errors="coerce").dt.normalize()
 		).groupby("_order_date", as_index=False).agg(
@@ -414,19 +405,30 @@ class AnalyticsEngine:
 		result["last_order"] = result["last_order"].dt.strftime("%Y-%m-%d")
 		return result.sort_values("sales", ascending=False).head(limit).round(2).to_dict("records")
 
-	def recommendations(self, customer_id: str | None = None, limit: int = 5) -> list[dict[str, object]]:
-		purchased = set(self.frame.loc[self.frame["Customer ID"].eq(customer_id), "Product ID"]) if customer_id else set()
-		result = self.frame.groupby(["Product ID", "Product Name", "Category"], as_index=False).agg(
+	def recommendations(self, customer_id: str | None = None, limit: int = 5, region: str | None = None, city: str | None = None) -> list[dict[str, object]]:
+		frame = self.filtered(region=region, city=city)
+		purchased = set(frame.loc[frame["Customer ID"].eq(customer_id), "Product ID"]) if customer_id else set()
+		result = frame.groupby(["Product ID", "Product Name", "Category"], as_index=False).agg(
 			sales=("Sales", "sum"), units=("Quantity", "sum"), profit=("Profit", "sum")
 		)
 		result = result[~result["Product ID"].isin(purchased)]
 		result["score"] = (result["sales"].rank(pct=True) * 0.6 + result["profit"].rank(pct=True) * 0.4).round(4)
 		return result.sort_values("score", ascending=False).head(limit).round(2).to_dict("records")
 
-	def quality(self) -> dict[str, object]:
+	def quality(self, region: str | None = None, city: str | None = None) -> dict[str, object]:
 		"""Return source-file quality metrics, before normalization fills or estimates values."""
 		stats = getattr(self, "source_quality", {})
-		records = int(stats.get("records", len(self.frame)))
+		frame = self.filtered(region=region, city=city) if region or city else self.frame
+		if region or city:
+			stats = {
+				"records": len(frame),
+				"columns": len(self.source_columns),
+				"missing_values": int(frame.isna().sum().sum()),
+				"rows_with_missing": int(frame.isna().any(axis=1).sum()),
+				"duplicate_rows": int(frame.duplicated().sum()),
+				"invalid_dates": int(pd.to_datetime(frame["Order Date"], errors="coerce").isna().sum()),
+			}
+		records = int(stats.get("records", len(frame)))
 		columns = int(stats.get("columns", len(self.source_columns)))
 		cells = records * columns
 		completeness = 100 * (1 - stats.get("missing_values", 0) / cells) if cells else 0.0
@@ -436,7 +438,7 @@ class AnalyticsEngine:
 			"records": records,
 			"columns": columns,
 			"source_columns": self.source_columns,
-			"status_counts": self.status_counts,
+			"status_counts": frame["Return Status"].value_counts().astype(int).to_dict() if region or city else self.status_counts,
 			"has_profit_data": self.has_profit_data,
 			"profit_is_estimated": not self.has_profit_data,
 			"estimated_profit_margin": self.ESTIMATED_PROFIT_MARGIN if not self.has_profit_data else None,
@@ -448,10 +450,10 @@ class AnalyticsEngine:
 			"uniqueness": round(max(0.0, min(100.0, uniqueness)), 2),
 			"date_validity": round(max(0.0, min(100.0, date_validity)), 2),
 			"quality_score": round(max(0.0, min(100.0, (completeness + uniqueness + date_validity) / 3)), 2),
-			"negative_profit_rows": int((self.frame["Profit"] < 0).sum()),
-			"returned_orders": int(self.frame["Return Flag"].sum()),
-			"date_min": self.frame["Order Date"].min().strftime("%Y-%m-%d"),
-			"date_max": self.frame["Order Date"].max().strftime("%Y-%m-%d"),
+			"negative_profit_rows": int((frame["Profit"] < 0).sum()),
+			"returned_orders": int(frame["Return Flag"].sum()),
+			"date_min": frame["Order Date"].min().strftime("%Y-%m-%d") if not frame.empty else "",
+			"date_max": frame["Order Date"].max().strftime("%Y-%m-%d") if not frame.empty else "",
 		}
 
 	def forecast_daily_sales(
@@ -461,6 +463,8 @@ class AnalyticsEngine:
 		horizon: int = 1,
 		observed_sales: float | None = None,
 		model: str | None = None,
+		region: str | None = None,
+		city: str | None = None,
 	) -> dict[str, object]:
 		"""Train on past daily observations and forecast the day after the selected/latest date."""
 		horizon = max(1, min(int(horizon), 30))
@@ -472,10 +476,19 @@ class AnalyticsEngine:
 			"loss_basis": "Unavailable because the source has no cost or expense data",
 			"return_rate": 0.0,
 		}
-		if self.daily_frame.empty:
+		if region or city:
+			region_frame = self.filtered(region=region, city=city).copy()
+			frame = region_frame.assign(
+				_order_date=pd.to_datetime(region_frame["Order Date"], errors="coerce").dt.normalize()
+			).groupby("_order_date", as_index=False).agg(
+				sales=("Sales", "sum"),
+				orders=("Order ID", "nunique"),
+			).rename(columns={"_order_date": "Order Date"})
+		else:
+			frame = self.daily_frame.copy()
+		if frame.empty:
 			return empty
 
-		frame = self.daily_frame.copy()
 		frame["Order Date"] = pd.to_datetime(frame["Order Date"], errors="coerce").dt.normalize()
 		frame["sales"] = pd.to_numeric(frame["sales"], errors="coerce").fillna(0)
 		frame["orders"] = pd.to_numeric(frame.get("orders", 0), errors="coerce").fillna(0)
@@ -641,7 +654,7 @@ class AnalyticsEngine:
 			"profit_basis": "Estimated at 30% margin; source has no profit or cost field",
 			"loss_rate": round(loss_rate, 4) if loss_rate is not None else None,
 			"loss_basis": f"{self.prediction_loss_basis} ({loss_rate:.1%} historical rate)" if loss_rate is not None else self.prediction_loss_basis,
-			"return_rate": round(float(self.frame["Return Flag"].mean() * 100) if "Return Flag" in self.frame.columns else 0.0, 2),
+			"return_rate": round(float(self.filtered(region=region, city=city)["Return Flag"].mean() * 100) if "Return Flag" in self.frame.columns else 0.0, 2),
 		}
 		if selected_model_name == "xgboost" or xgb_mae is not None:
 			result["xgboost_validation_mae"] = round(xgb_mae, 2) if xgb_mae is not None else None
@@ -651,9 +664,12 @@ class AnalyticsEngine:
 		result["xgboost_available"] = XGBOOST_AVAILABLE
 		return result
 
-	def predict(self, quantity: int, sales: float, discount: float, category: str, region: str) -> dict[str, object]:
+	def predict(self, quantity: int, sales: float, discount: float, category: str, region: str, city: str | None = None) -> dict[str, object]:
 		baseline = self.frame[self.frame["Category"].eq(category) & self.frame["Region"].eq(region)]
-		baseline = baseline if not baseline.empty else self.frame
+		if city:
+			baseline = baseline[baseline["City"].str.casefold().eq(city.casefold())]
+		if baseline.empty:
+			baseline = self.filtered(region=region, city=city) if city else self.frame
 		baseline_sales = float(baseline["Sales"].sum())
 		margin = float(baseline["Profit"].sum() / baseline_sales) if baseline_sales else 0
 		return_rate = float(baseline["Return Flag"].mean())
@@ -985,14 +1001,16 @@ class AnalyticsEngine:
 		year: str | None = None,
 		horizon: int = 1,
 		observed_sales: float | None = None,
+		region: str | None = None,
+		city: str | None = None,
 	) -> dict[str, object]:
 		rf_result = self.forecast_daily_sales(
 			selected_date=selected_date, year=year, horizon=horizon,
-			observed_sales=observed_sales, model="randomforest",
+			observed_sales=observed_sales, model="randomforest", region=region, city=city,
 		)
 		xgb_result = self.forecast_daily_sales(
 			selected_date=selected_date, year=year, horizon=horizon,
-			observed_sales=observed_sales, model="xgboost",
+			observed_sales=observed_sales, model="xgboost", region=region, city=city,
 		) if XGBOOST_AVAILABLE else None
 
 		comparison: dict[str, object] = {

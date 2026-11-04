@@ -132,22 +132,23 @@ ACTIVE_DATASET_FILE = ROOT / "data" / "raw" / ".active_dataset_path.txt"
 DATASET_VERSIONS_DIR = ROOT / "data" / "raw" / "versions"
 DATASET_UPLOADS_DIR = ROOT / "data" / "raw" / "uploads"
 
-VALID_ROLES = {"Admin", "Business Manager", "Analyst", "Viewer"}
+VALID_ROLES = {"Admin", "Analyst", "Manager", "Business Manager", "Viewer"}
+MANAGER_ROLES = {"Manager", "Business Manager"}
 
 
 def resolve_dataset_path() -> Path:
-    env_dataset = os.getenv("DATASET_PATH")
-    if env_dataset:
-        candidate = Path(env_dataset)
-        if candidate.exists():
-            return candidate
-
     if ACTIVE_DATASET_FILE.exists():
         stored = ACTIVE_DATASET_FILE.read_text().strip()
         if stored:
             candidate = Path(stored)
             if candidate.exists():
                 return candidate
+
+    env_dataset = os.getenv("DATASET_PATH")
+    if env_dataset:
+        candidate = Path(env_dataset)
+        if candidate.exists():
+            return candidate
 
     if LARGE_DATASET.exists():
         return LARGE_DATASET
@@ -323,9 +324,11 @@ except Exception:
     pass
 
 
-def token_for(email: str, role: str) -> str:
+def token_for(email: str, role: str, branch: str | None = None) -> str:
     secret = os.getenv("APP_SECRET", "local-development-secret").encode()
     payload = {"sub": email, "role": role, "exp": int((datetime.now(timezone.utc) + timedelta(hours=8)).timestamp())}
+    if branch:
+        payload["branch"] = branch
     body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
     signature = hmac.new(secret, body.encode(), hashlib.sha256).hexdigest()
     return f"{body}.{signature}"
@@ -345,6 +348,86 @@ def current_user(credentials: HTTPAuthorizationCredentials | None = Depends(secu
         return payload
     except (ValueError, KeyError, json.JSONDecodeError):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+
+def require_admin(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
+    if user.get("role") != "Admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required")
+    return user
+
+
+def city_region_map() -> dict[str, str]:
+    pairs = engine.frame[["City", "Region"]].dropna().copy()
+    pairs["City"] = pairs["City"].astype(str).str.strip()
+    pairs["Region"] = pairs["Region"].astype(str).str.strip()
+    pairs = pairs[(pairs["City"] != "") & (pairs["Region"] != "")]
+    result: dict[str, str] = {}
+    for city, group in pairs.groupby("City", sort=True):
+        regions = group["Region"].drop_duplicates().tolist()
+        if len(regions) == 1:
+            result[str(city)] = str(regions[0])
+    return result
+
+
+def _city_region(city: str) -> str | None:
+    return next(
+        (region for name, region in city_region_map().items() if name.casefold() == city.casefold()),
+        None,
+    )
+
+
+def _assigned_city(branch: str | None) -> str | None:
+    value = str(branch or "").strip()
+    city = next((name for name in engine.cities if name.casefold() == value.casefold()), None)
+    return city if city and _city_region(city) else None
+
+
+def branch_city(user: dict[str, str], requested_city: str | None = None) -> str | None:
+    if user.get("role") not in MANAGER_ROLES:
+        return requested_city
+    assigned_branch = str(user.get("branch") or "").strip()
+    if not assigned_branch:
+        raise HTTPException(status_code=403, detail="Manager account has no assigned city")
+    match = _assigned_city(assigned_branch)
+    if match:
+        return match
+    raise HTTPException(status_code=403, detail="Manager account has an invalid city assignment; ask an Admin to assign a city")
+
+
+def branch_region(user: dict[str, str], requested_region: str | None = None) -> str | None:
+    if user.get("role") not in MANAGER_ROLES:
+        return requested_region
+    assigned_city = branch_city(user)
+    region = _city_region(assigned_city or "")
+    if region:
+        return region
+    raise HTTPException(status_code=403, detail="Manager account has an invalid city assignment; ask an Admin to assign a city")
+
+
+def assigned_branch(role: str, branch: str | None) -> str | None:
+    if role not in MANAGER_ROLES:
+        return None
+    requested = str(branch or "").strip()
+    match = next((city for city in engine.cities if city.casefold() == requested.casefold()), None)
+    if not match or not _city_region(match):
+        raise HTTPException(status_code=400, detail="A valid city with a sales-region mapping must be assigned to each Manager")
+    return match
+
+
+def require_upload_access(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
+    if user.get("role") not in {"Admin", "Analyst", *MANAGER_ROLES}:
+        raise HTTPException(status_code=403, detail="Dataset upload is not permitted for this role")
+    if user.get("role") in MANAGER_ROLES:
+        branch_region(user)
+    return user
+
+
+def require_sales_delete_access(user: dict[str, str] = Depends(current_user)) -> dict[str, str]:
+    if user.get("role") != "Admin" and user.get("role") not in MANAGER_ROLES:
+        raise HTTPException(status_code=403, detail="Only Admins or Managers can delete sales records")
+    if user.get("role") in MANAGER_ROLES:
+        branch_region(user)
+    return user
 
 
 class RegisterRequest(BaseModel):
@@ -377,12 +460,14 @@ class VerifyOtpRequest(BaseModel):
 
 class RoleUpdateRequest(BaseModel):
     role: str = Field(min_length=1, max_length=64)
+    branch: str | None = Field(default=None, max_length=80)
 
 
 class InviteUserRequest(BaseModel):
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8)
     role: str = "Viewer"
+    branch: str | None = Field(default=None, max_length=80)
 
 
 class FilterOptionsRequest(BaseModel):
@@ -395,6 +480,7 @@ class PredictionRequest(BaseModel):
     discount: float = Field(ge=0, le=1)
     category: str
     region: str
+    city: str | None = None
 
 
 class SaleRecordRequest(BaseModel):
@@ -452,7 +538,6 @@ def health() -> dict[str, object]:
 
 @app.post("/api/auth/register")
 def register(request: RegisterRequest, session: Session = Depends(get_db_session)) -> dict[str, str]:
-    role = request.role if request.role in VALID_ROLES else "Viewer"
     email = request.email.strip().lower()
     phone = request.phone.strip() if request.phone else None
     clean_otp = (request.otp_code or "").strip()
@@ -507,21 +592,20 @@ def register(request: RegisterRequest, session: Session = Depends(get_db_session
     user = get_user_by_email(session, email)
     if user:
         user.password = hash_password(request.password)
-        user.role = role
         user.phone = phone
         user.otp_code = None
         user.otp_expires_at = None
         session.flush()
     else:
-        created = create_user(session, email, hash_password(request.password), role=role, phone=phone)
-        user = created
+        user = create_user(session, email, hash_password(request.password), role="Viewer", phone=phone)
+    role = user.role or "Viewer"
     # Remove any used OTP cache entries for this phone/email so it can't be replayed
     for k in [_normalize_target(phone), _normalize_target(email), phone.lower(), email.lower()]:
         if k:
             OTP_CACHE.pop(k, None)
 
     return {
-        "access_token": token_for(email, role),
+        "access_token": token_for(email, role, user.branch),
         "token_type": "bearer",
         "role": role,
         "message": "Phone number verified with OTP. Account created and saved to the Nexus SQL database.",
@@ -544,7 +628,15 @@ def login(request: LoginRequest, session: Session = Depends(get_db_session)) -> 
 
     if not user or not is_valid:
         raise HTTPException(status_code=401, detail="Invalid email or password")
-    return {"access_token": token_for(email, user.role or "Viewer"), "token_type": "bearer", "role": user.role or "Viewer"}
+    assigned_city = _assigned_city(user.branch)
+    return {
+        "access_token": token_for(email, user.role or "Viewer", user.branch),
+        "token_type": "bearer",
+        "role": user.role or "Viewer",
+        "branch": user.branch or "",
+        "city": assigned_city or "",
+        "region": _city_region(assigned_city) or "" if assigned_city else "",
+    }
 
 
 @app.post("/api/auth/forgot-password")
@@ -740,7 +832,7 @@ def verify_otp_reset(request: VerifyOtpRequest, session: Session = Depends(get_d
             OTP_CACHE.pop(k, None)
 
     return {
-        "access_token": token_for(user_email, user_role),
+        "access_token": token_for(user_email, user_role, user.branch if user else None),
         "token_type": "bearer",
         "role": user_role,
         "message": "Mobile OTP verified. New password saved successfully. (Re-login with your new password.)",
@@ -756,12 +848,21 @@ def dashboard_kpis(
     customer_segment: str | None = None,
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
+    regions = [region] if region else engine.regions
+    city_regions = city_region_map()
+    if city:
+        city_regions = {city: city_regions[city]} if city in city_regions else {}
+    elif user.get("role") in MANAGER_ROLES and region:
+        city_regions = {name: mapped_region for name, mapped_region in city_regions.items() if mapped_region.casefold() == region.casefold()}
     return {
         "kpis": engine.kpis(region, category, year, city, customer_segment),
         "filters": {
-            "regions": engine.regions,
+            "regions": regions,
+            "city_regions": city_regions,
             "categories": engine.categories,
-            "cities": engine.get_cities(region),
+            "cities": [city] if city else engine.get_cities(region),
             "customer_segments": engine.customer_segments,
             "years": engine.years,
         },
@@ -770,16 +871,22 @@ def dashboard_kpis(
 
 @app.get("/api/sales/trend")
 def sales_trend(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.trend(region, category, year, city)
 
 
 @app.get("/api/sales/daily")
 def sales_daily(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.daily_trend(region, category, year, city)
 
 
 @app.get("/api/sales/daily/report")
 def sales_daily_report(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.daily_performance_report(region, category, year, city, month, customer_segment)
 
 
@@ -787,16 +894,22 @@ def sales_daily_report(region: str | None = None, category: str | None = None, y
 def sales_daily_forecast(
     date: str | None = None,
     year: str | None = None,
+    region: str | None = None,
+    city: str | None = None,
     sales: float | None = Query(default=None, ge=0),
     days: int = Query(default=1, ge=1, le=30),
     model: str | None = Query(default=None),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
-    return engine.forecast_daily_sales(date, year, days, sales, model)
+    region = branch_region(user, region)
+    city = branch_city(user, city)
+    return engine.forecast_daily_sales(date, year, days, sales, model, region=region, city=city)
 
 
 @app.get("/api/sales/category")
 def sales_category(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.category_performance(region=region, category=category, year=year, city=city)
 
 
@@ -813,6 +926,8 @@ def list_sales_records(
     offset: int = Query(default=0, ge=0),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.get_sales_records(
         search=search, category=category, region=region, city=city, year=year, limit=limit, offset=offset, month=month, customer_segment=customer_segment
     )
@@ -821,7 +936,7 @@ def list_sales_records(
 @app.post("/api/sales/records")
 def create_sale_record(
     request: SaleRecordRequest,
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     data = request.dict()
     created = engine.create_sale(data)
@@ -838,7 +953,7 @@ def create_sale_record(
 def update_sale_record(
     order_id: str,
     request: SaleUpdateRequest,
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     payload = {k: v for k, v in request.dict().items() if v is not None}
     try:
@@ -857,8 +972,14 @@ def update_sale_record(
 @app.delete("/api/sales/records/{order_id}")
 def delete_sale_record(
     order_id: str,
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_sales_delete_access),
 ) -> dict[str, object]:
+    if user.get("role") in MANAGER_ROLES:
+        region = branch_region(user)
+        city = branch_city(user)
+        matches = engine.get_sales_records(search=order_id, region=region, city=city, limit=500000).get("records", [])
+        if not matches or str(matches[0].get("order_id", "")) != order_id:
+            raise HTTPException(status_code=404, detail="Sales record not found in your branch")
     try:
         deleted = engine.delete_sale(order_id)
     except ValueError as exc:
@@ -874,7 +995,7 @@ def delete_sale_record(
 
 @app.post("/api/sales/refresh")
 def refresh_sales_data(
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     engine.reload()
     return {
@@ -888,17 +1009,23 @@ def refresh_sales_data(
 
 @app.get("/api/products/top")
 def products_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.top_products(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 
 
 @app.get("/api/customers/top")
 def customers_top(region: str | None = None, category: str | None = None, year: str | None = None, city: str | None = None, month: int | None = Query(default=None, ge=1, le=12), customer_segment: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.customers(region=region, category=category, year=year, city=city, month=month, customer_segment=customer_segment)
 
 
 @app.get("/api/recommendations")
-def recommendations(customer_id: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
-    return engine.recommendations(customer_id)
+def recommendations(region: str | None = None, customer_id: str | None = None, user: dict[str, str] = Depends(current_user)) -> list[dict[str, object]]:
+    region = branch_region(user, region)
+    city = branch_city(user)
+    return engine.recommendations(customer_id, region=region, city=city)
 
 
 @app.post("/api/admin/regions")
@@ -947,24 +1074,32 @@ def delete_category(name: str, user: dict[str, str] = Depends(current_user)) -> 
 
 @app.get("/api/data/quality")
 def data_quality(user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
-    return engine.quality()
+    region = branch_region(user)
+    city = branch_city(user)
+    return engine.quality(region=region, city=city)
 
 
 @app.post("/api/predict")
 def predict(request: PredictionRequest, user: dict[str, str] = Depends(current_user)) -> dict[str, object]:
+    allowed_region = branch_region(user, request.region)
+    if allowed_region and allowed_region.casefold() != request.region.strip().casefold():
+        raise HTTPException(status_code=403, detail="Prediction is restricted to your assigned branch")
+    city = branch_city(user, request.city)
+    if user.get("role") in MANAGER_ROLES and city and request.city and city.casefold() != request.city.strip().casefold():
+        raise HTTPException(status_code=403, detail="Prediction is restricted to your assigned city")
     if request.category not in engine.categories or request.region not in engine.regions:
         raise HTTPException(status_code=422, detail="Category or region is not present in the dataset")
-    return engine.predict(request.quantity, request.sales, request.discount, request.category, request.region)
+    if city and city not in engine.get_cities(allowed_region):
+        raise HTTPException(status_code=422, detail="City is not present in the selected region")
+    return engine.predict(request.quantity, request.sales, request.discount, request.category, request.region, city=city)
 
 
 @app.post("/api/data/upload")
 async def upload_dataset(
     file: UploadFile = File(...),
     mode: str = Form("replace"),
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_upload_access),
 ) -> dict[str, object]:
-    if user.get("role") != "Admin":
-        raise HTTPException(status_code=403, detail="Admin role required")
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="CSV file required")
     if mode not in {"append", "replace"}:
@@ -973,6 +1108,25 @@ async def upload_dataset(
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="CSV file is empty")
+
+    manager_branch = branch_city(user) if user.get("role") in MANAGER_ROLES else None
+    manager_region = branch_region(user) if manager_branch else None
+    try:
+        incoming = pd.read_csv(pd.io.common.BytesIO(content))
+    except (UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to read CSV data: {exc}") from exc
+
+    if manager_branch:
+        city_column = next((name for name in incoming.columns if str(name).strip().casefold() == "city"), None)
+        region_column = next((name for name in incoming.columns if str(name).strip().casefold() == "region"), None)
+        if not city_column or not region_column:
+            raise HTTPException(status_code=422, detail="Manager uploads must include both city and region columns.")
+        incoming_cities = incoming[city_column].fillna("").astype(str).str.strip()
+        incoming_regions = incoming[region_column].fillna("").astype(str).str.strip()
+        if incoming_cities.empty or not incoming_cities.str.casefold().eq(manager_branch.casefold()).all():
+            raise HTTPException(status_code=403, detail="Manager uploads may contain records only for the assigned city.")
+        if not incoming_regions.str.casefold().eq(str(manager_region).casefold()).all():
+            raise HTTPException(status_code=403, detail="Uploaded city records must use their automatically assigned region.")
 
     DATASET_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
     upload_id = uuid.uuid4().hex
@@ -983,10 +1137,9 @@ async def upload_dataset(
     ).strip("._") or "dataset.csv"
     target = DATASET_UPLOADS_DIR / f"{upload_id}_{original_filename}"
 
-    if mode == "append":
+    if mode == "append" or manager_branch:
         try:
             existing = pd.read_csv(DATASET)
-            incoming = pd.read_csv(pd.io.common.BytesIO(content))
         except (OSError, UnicodeDecodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
             raise HTTPException(status_code=422, detail=f"Unable to read CSV data: {exc}") from exc
 
@@ -1003,27 +1156,44 @@ async def upload_dataset(
             raise HTTPException(status_code=422, detail=f"CSV columns do not match the current dataset ({'; '.join(details)}).")
         incoming = incoming.reindex(columns=existing.columns)
 
-        existing_ids = set(existing["order_id"].dropna().astype(str).str.strip().str.casefold())
-        incoming_ids = incoming["order_id"].astype("string").str.strip()
-        if incoming_ids.isna().any() or incoming_ids.eq("").any():
-            raise HTTPException(status_code=422, detail="Every imported row must have an order_id.")
-        duplicate_mask = incoming_ids.str.casefold().duplicated(keep="first") | incoming_ids.str.casefold().isin(existing_ids)
-        additions = incoming.loc[~duplicate_mask].copy()
-        added_records = len(additions)
-        skipped_duplicates = len(incoming) - added_records
-        if not added_records:
-            return {
-                "status": "unchanged",
-                "filename": original_filename,
-                "records_loaded": len(engine.frame),
-                "added_records": 0,
-                "skipped_duplicates": skipped_duplicates,
-                "db_synced": True,
-                "db_counts": {},
-                "db_error": None,
-            }
-
-        combined = pd.concat([existing, additions], ignore_index=True)
+        if manager_branch and mode == "replace":
+            city_column = next((name for name in existing.columns if str(name).strip().casefold() == "city"), None)
+            if not city_column:
+                raise HTTPException(status_code=422, detail="The active dataset has no city column to scope this upload.")
+            existing_cities = existing[city_column].fillna("").astype(str).str.strip()
+            remaining = existing.loc[~existing_cities.str.casefold().eq(manager_branch.casefold())]
+            remaining_ids = set(remaining["order_id"].dropna().astype(str).str.strip().str.casefold())
+            incoming_ids = incoming["order_id"].astype("string").str.strip()
+            normalized_ids = incoming_ids.str.casefold()
+            if incoming_ids.isna().any() or incoming_ids.eq("").any():
+                raise HTTPException(status_code=422, detail="Every imported row must have an order_id.")
+            if normalized_ids.duplicated().any() or normalized_ids.isin(remaining_ids).any():
+                raise HTTPException(status_code=422, detail="Replacement order IDs must be unique and cannot match another branch.")
+            additions = incoming
+            added_records = len(incoming)
+            skipped_duplicates = 0
+            combined = pd.concat([remaining, additions], ignore_index=True)
+        else:
+            existing_ids = set(existing["order_id"].dropna().astype(str).str.strip().str.casefold())
+            incoming_ids = incoming["order_id"].astype("string").str.strip()
+            if incoming_ids.isna().any() or incoming_ids.eq("").any():
+                raise HTTPException(status_code=422, detail="Every imported row must have an order_id.")
+            duplicate_mask = incoming_ids.str.casefold().duplicated(keep="first") | incoming_ids.str.casefold().isin(existing_ids)
+            additions = incoming.loc[~duplicate_mask].copy()
+            added_records = len(additions)
+            skipped_duplicates = len(incoming) - added_records
+            if not added_records:
+                return {
+                    "status": "unchanged",
+                    "filename": original_filename,
+                    "records_loaded": len(engine.frame),
+                    "added_records": 0,
+                    "skipped_duplicates": skipped_duplicates,
+                    "db_synced": True,
+                    "db_counts": {},
+                    "db_error": None,
+                }
+            combined = pd.concat([existing, additions], ignore_index=True)
         temporary_path = DATASET_UPLOADS_DIR / f".{upload_id}.tmp.csv"
         try:
             combined.to_csv(temporary_path, index=False)
@@ -1126,6 +1296,8 @@ def segments_breakdown(
     Accepts optional scope filters (region, city, category, customer_segment, year) — when provided, the
     entire segment breakdown is computed only against orders that match those filters.
     """
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
 
     if df.empty:
@@ -1289,6 +1461,8 @@ def segments_regions(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     """Sales / profit / KPIs grouped by Region — computed only against the filtered scope."""
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
     if df.empty:
         return {"rows": [], "totals": {}}
@@ -1307,6 +1481,8 @@ def segments_cities(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     """Top N cities ranked by revenue within the filtered scope."""
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
     if df.empty:
         return {"rows": [], "totals": {}}
@@ -1325,6 +1501,8 @@ def segments_categories(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     """Sales / profit / KPIs grouped by Product Category within the filtered scope."""
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
     if df.empty:
         return {"rows": [], "totals": {}}
@@ -1342,6 +1520,8 @@ def segments_customer_segments(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     """Sales / profit / KPIs grouped by Customer Segment within the filtered scope."""
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
     if df.empty:
         return {"rows": [], "totals": {}}
@@ -1359,6 +1539,8 @@ def segments_matrix(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     """Category × Region cross-segment heatmap matrix with intensity + margin + returns."""
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     df = engine.filtered(region=region, category=category, year=year, city=city, customer_segment=customer_segment).copy()
     if df.empty:
         return {"regions": [], "categories": [], "matrix": [], "totals": {}}
@@ -1409,11 +1591,15 @@ def segments_matrix(
 def sales_daily_forecast_compare(
     date: str | None = None,
     year: str | None = None,
+    region: str | None = None,
+    city: str | None = None,
     sales: float | None = Query(default=None, ge=0),
     days: int = Query(default=1, ge=1, le=30),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
-    return engine.compare_forecast_models(date, year, days, sales)
+    region = branch_region(user, region)
+    city = branch_city(user, city)
+    return engine.compare_forecast_models(date, year, days, sales, region=region, city=city)
 
 
 @app.get("/api/sales/anomalies")
@@ -1426,6 +1612,8 @@ def sales_anomalies(
     sigma: float = Query(default=3.0, ge=1.0, le=6.0),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.detect_anomalies(region, category, year, city, window, sigma)
 
 
@@ -1437,6 +1625,8 @@ def ai_advisor(
     city: str | None = None,
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.ai_advisor_insights(region, category, year, city)
 
 
@@ -1449,12 +1639,14 @@ def customers_rfm(
     city: str | None = None,
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
+    region = branch_region(user, region)
+    city = branch_city(user, city)
     return engine.customer_rfm_predictions(limit, region, category, year, city)
 
 
 @app.get("/api/db/status")
 def database_status(
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     status_info: dict[str, object] = {
         "backend": get_db_backend(),
@@ -1522,8 +1714,8 @@ def management_users(
     session: Session = Depends(get_db_session),
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
-    if user.get("role") not in {"Admin", "Business Manager"}:
-        raise HTTPException(status_code=403, detail="Admin or Business Manager role required")
+    if user.get("role") != "Admin":
+        raise HTTPException(status_code=403, detail="Admin role required")
     from .database import User as DBUser
     query = session.query(DBUser)
     total = int(query.count())
@@ -1535,6 +1727,9 @@ def management_users(
             "id": int(u.id) if u.id else None,
             "email": str(u.email),
             "role": str(u.role or "Viewer"),
+            "branch": str(u.branch or ""),
+            "branch_city": next((city for city in engine.cities if city.casefold() == str(u.branch or "").casefold()), ""),
+            "branch_region": _city_region(str(u.branch or "")) or next((region for region in engine.regions if region.casefold() == str(u.branch or "").casefold()), ""),
             "created_at": str(u.created_at) if u.created_at else None,
             "updated_at": str(u.updated_at) if u.updated_at else None,
         })
@@ -1557,7 +1752,7 @@ def management_update_role(
     user_id: int,
     body: RoleUpdateRequest,
     session: Session = Depends(get_db_session),
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     if user.get("role") != "Admin":
         raise HTTPException(status_code=403, detail="Admin role required to update roles")
@@ -1570,6 +1765,7 @@ def management_update_role(
         raise HTTPException(status_code=404, detail="User not found")
     if str(target.email or "").lower() == str(user.get("sub") or user.get("email") or "").lower():
         raise HTTPException(status_code=400, detail="You cannot modify your own role")
+    target.branch = assigned_branch(new_role, body.branch)
     target.role = new_role
     target.updated_at = datetime.utcnow()
     session.commit()
@@ -1577,6 +1773,9 @@ def management_update_role(
         "id": int(target.id),
         "email": str(target.email),
         "role": str(target.role),
+        "branch": str(target.branch or ""),
+        "branch_city": target.branch or "" if target.role in MANAGER_ROLES else "",
+        "branch_region": _city_region(target.branch or "") if target.role in MANAGER_ROLES else "",
         "updated_at": str(target.updated_at),
     }
 
@@ -1585,7 +1784,7 @@ def management_update_role(
 def management_delete_user(
     user_id: int,
     session: Session = Depends(get_db_session),
-    user: dict[str, str] = Depends(current_user),
+    user: dict[str, str] = Depends(require_admin),
 ) -> dict[str, object]:
     if user.get("role") != "Admin":
         raise HTTPException(status_code=403, detail="Admin role required to delete users")
@@ -1609,13 +1808,12 @@ def management_invite_user(
     user: dict[str, str] = Depends(current_user),
 ) -> dict[str, object]:
     inviter_role = user.get("role")
-    if inviter_role not in {"Admin", "Business Manager"}:
-        raise HTTPException(status_code=403, detail="Admin or Business Manager role required to invite users")
+    if inviter_role != "Admin":
+        raise HTTPException(status_code=403, detail="Admin role required to invite users")
     new_role = body.role.strip()
     if new_role not in VALID_ROLES:
         raise HTTPException(status_code=400, detail=f"Invalid role. Must be one of: {sorted(VALID_ROLES)}")
-    if inviter_role == "Business Manager" and new_role == "Admin":
-        raise HTTPException(status_code=403, detail="Only Admins can invite users with the Admin role")
+    branch = assigned_branch(new_role, body.branch)
     email = body.email.strip().lower() if body.email else ""
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
         raise HTTPException(status_code=400, detail="A valid email is required")
@@ -1623,11 +1821,14 @@ def management_invite_user(
     existing = get_user_by_email(session, email)
     if existing:
         raise HTTPException(status_code=409, detail="User already exists")
-    created = create_user(session, email, hash_password(body.password), new_role)
+    created = create_user(session, email, hash_password(body.password), new_role, branch=branch)
     return {
         "id": int(created.id),
         "email": str(created.email),
         "role": str(created.role),
+        "branch": str(created.branch or ""),
+        "branch_city": created.branch or "" if created.role in MANAGER_ROLES else "",
+        "branch_region": _city_region(created.branch or "") if created.role in MANAGER_ROLES else "",
         "created_at": str(created.created_at),
     }
 
