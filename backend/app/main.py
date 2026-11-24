@@ -127,16 +127,22 @@ def _lookup_otp(target: str, now: datetime | None = None) -> dict[str, object] |
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_DATASET = ROOT / "data" / "raw" / "ecommerce_sales_raw.csv"
-LARGE_DATASET = ROOT / "data" / "raw" / "ecommerce_sales_raw.csv.csv"
+CANONICAL_DATASET = ROOT / "data" / "raw" / "ecommerce_sales_raw.csv.csv"
+LARGE_DATASET = CANONICAL_DATASET
 ACTIVE_DATASET_FILE = ROOT / "data" / "raw" / ".active_dataset_path.txt"
 DATASET_VERSIONS_DIR = ROOT / "data" / "raw" / "versions"
-DATASET_UPLOADS_DIR = ROOT / "data" / "raw" / "uploads"
+README_PATH = ROOT / "README.md"
+README_DATASET_START = "<!-- DATASET_STATUS_START -->"
+README_DATASET_END = "<!-- DATASET_STATUS_END -->"
 
 VALID_ROLES = {"Admin", "Analyst", "Manager", "Business Manager", "Viewer"}
 MANAGER_ROLES = {"Manager", "Business Manager"}
 
 
 def resolve_dataset_path() -> Path:
+    if CANONICAL_DATASET.exists():
+        return CANONICAL_DATASET
+
     if ACTIVE_DATASET_FILE.exists():
         stored = ACTIVE_DATASET_FILE.read_text().strip()
         if stored:
@@ -150,11 +156,11 @@ def resolve_dataset_path() -> Path:
         if candidate.exists():
             return candidate
 
-    if LARGE_DATASET.exists():
-        return LARGE_DATASET
-
     if DEFAULT_DATASET.exists():
         return DEFAULT_DATASET
+
+    if LARGE_DATASET.exists():
+        return LARGE_DATASET
 
     return Path(r"C:\Users\shiva\Downloads\data analytics project\ecommerce_sales_raw.csv")
 
@@ -162,18 +168,60 @@ def resolve_dataset_path() -> Path:
 DATASET = resolve_dataset_path()
 
 
-def _archive_active_dataset() -> None:
-    if not DATASET.exists() or DATASET.parent.resolve() == DATASET_VERSIONS_DIR.resolve():
+def _archive_dataset(dataset_path: Path) -> None:
+    if not dataset_path.exists() or dataset_path.parent.resolve() == DATASET_VERSIONS_DIR.resolve():
         return
 
     DATASET_VERSIONS_DIR.mkdir(parents=True, exist_ok=True)
     version_id = uuid.uuid4().hex
-    shutil.copy2(DATASET, DATASET_VERSIONS_DIR / f"{version_id}.csv")
+    shutil.copy2(dataset_path, DATASET_VERSIONS_DIR / f"{version_id}.csv")
     metadata = {
-        "filename": DATASET.name,
+        "filename": dataset_path.name,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     (DATASET_VERSIONS_DIR / f"{version_id}.json").write_text(json.dumps(metadata), encoding="utf-8")
+
+
+def _archive_active_dataset() -> None:
+    _archive_dataset(DATASET)
+
+
+def _update_readme_dataset_status() -> None:
+    readme = README_PATH.read_text(encoding="utf-8")
+    if readme.count(README_DATASET_START) != 1 or readme.count(README_DATASET_END) != 1:
+        raise ValueError("README dataset status markers are missing or duplicated.")
+    start = readme.index(README_DATASET_START)
+    end_marker = readme.index(README_DATASET_END)
+    if end_marker < start:
+        raise ValueError("README dataset status markers are out of order.")
+    end = end_marker + len(README_DATASET_END)
+
+    updated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    status = "\n".join(
+        [
+            README_DATASET_START,
+            f"- **Canonical file**: `data/raw/{CANONICAL_DATASET.name}`",
+            f"- **Records**: {len(engine.frame):,}",
+            f"- **Columns**: {len(engine.source_columns):,}",
+            f"- **Last updated**: {updated_at}",
+            README_DATASET_END,
+        ]
+    )
+    updated_readme = f"{readme[:start]}{status}{readme[end:]}"
+    temporary_path = README_PATH.with_name(f".{README_PATH.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary_path.write_text(updated_readme, encoding="utf-8")
+        os.replace(temporary_path, README_PATH)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _refresh_readme_dataset_status() -> tuple[bool, str | None]:
+    try:
+        _update_readme_dataset_status()
+    except (OSError, ValueError) as exc:
+        return False, str(exc)
+    return True, None
 
 
 def _dataset_versions() -> list[dict[str, str]]:
@@ -941,10 +989,13 @@ def create_sale_record(
     data = request.dict()
     created = engine.create_sale(data)
     db_sync.upsert_sale_to_db(created)
+    readme_updated, readme_error = _refresh_readme_dataset_status()
     return {
         "status": "created",
         "record": created,
         "db_synced": True,
+        "readme_updated": readme_updated,
+        "readme_error": readme_error,
         "message": f"Sale order {created.get('order_id')} created successfully",
     }
 
@@ -961,10 +1012,13 @@ def update_sale_record(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     db_sync.upsert_sale_to_db(updated)
+    readme_updated, readme_error = _refresh_readme_dataset_status()
     return {
         "status": "updated",
         "record": updated,
         "db_synced": True,
+        "readme_updated": readme_updated,
+        "readme_error": readme_error,
         "message": f"Sale order {order_id} updated successfully",
     }
 
@@ -985,10 +1039,13 @@ def delete_sale_record(
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     db_sync.delete_sale_from_db(deleted)
+    readme_updated, readme_error = _refresh_readme_dataset_status()
     return {
         "status": "deleted",
         "order_id": deleted,
         "db_synced": True,
+        "readme_updated": readme_updated,
+        "readme_error": readme_error,
         "message": f"Sale order {order_id} deleted successfully",
     }
 
@@ -1128,14 +1185,13 @@ async def upload_dataset(
         if not incoming_regions.str.casefold().eq(str(manager_region).casefold()).all():
             raise HTTPException(status_code=403, detail="Uploaded city records must use their automatically assigned region.")
 
-    DATASET_UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    CANONICAL_DATASET.parent.mkdir(parents=True, exist_ok=True)
     upload_id = uuid.uuid4().hex
     original_filename = re.sub(
         r"[^A-Za-z0-9._-]+",
         "_",
         Path(file.filename.replace("\\", "/")).name,
     ).strip("._") or "dataset.csv"
-    target = DATASET_UPLOADS_DIR / f"{upload_id}_{original_filename}"
 
     if mode == "append" or manager_branch:
         try:
@@ -1182,7 +1238,7 @@ async def upload_dataset(
             additions = incoming.loc[~duplicate_mask].copy()
             added_records = len(additions)
             skipped_duplicates = len(incoming) - added_records
-            if not added_records:
+            if not added_records and DATASET.resolve() == CANONICAL_DATASET.resolve():
                 return {
                     "status": "unchanged",
                     "filename": original_filename,
@@ -1192,31 +1248,29 @@ async def upload_dataset(
                     "db_synced": True,
                     "db_counts": {},
                     "db_error": None,
+                    "readme_updated": True,
+                    "readme_error": None,
                 }
             combined = pd.concat([existing, additions], ignore_index=True)
-        temporary_path = DATASET_UPLOADS_DIR / f".{upload_id}.tmp.csv"
-        try:
-            combined.to_csv(temporary_path, index=False)
-            dataset_engine = AnalyticsEngine(temporary_path)
-            _archive_active_dataset()
-            os.replace(temporary_path, target)
-        except (OSError, ValueError, pd.errors.ParserError) as exc:
-            temporary_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=422, detail=f"Unable to prepare the combined dataset: {exc}") from exc
-        _activate_dataset(target, dataset_engine)
     else:
-        temporary_path = DATASET_UPLOADS_DIR / f".{upload_id}.tmp.csv"
-        try:
-            temporary_path.write_bytes(content)
-            dataset_engine = AnalyticsEngine(temporary_path)
-            _archive_active_dataset()
-            os.replace(temporary_path, target)
-        except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-            temporary_path.unlink(missing_ok=True)
-            raise HTTPException(status_code=422, detail=f"Unable to load CSV data: {exc}") from exc
-        _activate_dataset(target, dataset_engine)
-        added_records = len(dataset_engine.frame)
+        combined = incoming
+        added_records = len(incoming)
         skipped_duplicates = 0
+
+    temporary_path = CANONICAL_DATASET.with_name(f".{CANONICAL_DATASET.name}.{upload_id}.tmp")
+    try:
+        combined.to_csv(temporary_path, index=False)
+        dataset_engine = AnalyticsEngine(temporary_path)
+        _archive_active_dataset()
+        if CANONICAL_DATASET.resolve() != DATASET.resolve():
+            _archive_dataset(CANONICAL_DATASET)
+        os.replace(temporary_path, CANONICAL_DATASET)
+        _activate_dataset(CANONICAL_DATASET, dataset_engine)
+    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"Unable to save imported dataset: {exc}") from exc
+
+    readme_updated, readme_error = _refresh_readme_dataset_status()
 
     db_counts: dict[str, int] = {}
     db_error: str | None = None
@@ -1234,6 +1288,8 @@ async def upload_dataset(
         "db_synced": db_error is None,
         "db_counts": db_counts,
         "db_error": db_error,
+        "readme_updated": readme_updated,
+        "readme_error": readme_error,
     }
 
 
@@ -1254,16 +1310,20 @@ def restore_dataset_version(version_id: str, user: dict[str, str] = Depends(curr
     version_path = DATASET_VERSIONS_DIR / f"{version_id}.csv"
     if not version_path.is_file():
         raise HTTPException(status_code=404, detail="Dataset version not found")
+    temporary_path = CANONICAL_DATASET.with_name(f".{CANONICAL_DATASET.name}.{uuid.uuid4().hex}.restore")
     try:
-        dataset_engine = AnalyticsEngine(version_path)
-    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        raise HTTPException(status_code=422, detail=f"Unable to restore dataset version: {exc}") from exc
-
-    try:
+        shutil.copy2(version_path, temporary_path)
+        dataset_engine = AnalyticsEngine(temporary_path)
         _archive_active_dataset()
-        _activate_dataset(version_path, dataset_engine)
-    except OSError as exc:
-        raise HTTPException(status_code=500, detail=f"Unable to activate dataset version: {exc}") from exc
+        if CANONICAL_DATASET.resolve() != DATASET.resolve():
+            _archive_dataset(CANONICAL_DATASET)
+        os.replace(temporary_path, CANONICAL_DATASET)
+        _activate_dataset(CANONICAL_DATASET, dataset_engine)
+    except (OSError, ValueError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
+        temporary_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=500, detail=f"Unable to restore dataset version: {exc}") from exc
+
+    readme_updated, readme_error = _refresh_readme_dataset_status()
 
     db_counts: dict[str, int] = {}
     db_error: str | None = None
@@ -1279,6 +1339,8 @@ def restore_dataset_version(version_id: str, user: dict[str, str] = Depends(curr
         "db_synced": db_error is None,
         "db_counts": db_counts,
         "db_error": db_error,
+        "readme_updated": readme_updated,
+        "readme_error": readme_error,
     }
 
 

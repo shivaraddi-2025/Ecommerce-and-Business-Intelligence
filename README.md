@@ -1,6 +1,6 @@
 # Nexus Commerce Intelligence
 
-A decision-support system for e-commerce analytics. It includes dataset-backed KPIs, sales forecasting, data quality metrics, role-aware authentication, product recommendations, REST APIs, and a React dashboard — all backed by 80,000 real orders.
+A decision-support system for e-commerce analytics. It includes dataset-backed KPIs, sales forecasting, data quality metrics, role-aware authentication, product recommendations, REST APIs, and a React dashboard.
 
 ---
 
@@ -108,7 +108,7 @@ my project/
 │       └── App.jsx         ← React dashboard
 ├── data/
 │   └── raw/
-│       └── ecommerce_sales_raw.csv.csv  ← 80,000 orders dataset
+│       └── ecommerce_sales_raw.csv.csv  ← canonical active dataset, updated by CSV imports
 ├── tests/
 │   └── test_api.py         ← Automated API tests
 ├── requirements.txt        ← Python dependencies
@@ -153,7 +153,12 @@ All 11 tests should pass.
 ## 📊 Dataset
 
 - **File**: `data/raw/ecommerce_sales_raw.csv.csv`
-- **Size**: 80,000 orders
-- **Columns**: Order ID, Order Date, Customer, Product, Category, Region, City, Sales, Profit, Discount, Quantity
+- **Current dataset status** (updated automatically after CSV imports):
+<!-- DATASET_STATUS_START -->
+- **Canonical file**: `data/raw/ecommerce_sales_raw.csv.csv`
+- **Records**: 80,006
+- **Columns**: 20
+- **Last updated**: 2026-11-09 06:23:18 UTC
+<!-- DATASET_STATUS_END -->
 - **Note**: Profit is estimated at a 30% margin (no cost data in the source)
-- Uploaded datasets remain active after restarting the backend. The backend reloads the saved active dataset path before falling back to `DATASET_PATH` or the default CSV.
+- CSV imports and restored versions are written to the canonical file above. The backend reloads this saved active dataset after restarting.

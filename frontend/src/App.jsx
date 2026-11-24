@@ -520,11 +520,16 @@ export default function App() {
   const handleDeleteRecord = async (orderId) => {
     if (!window.confirm(`Are you sure you want to delete order ${orderId}? This cannot be undone.`)) return;
     try {
-      await apiRequest(`/api/sales/records/${encodeURIComponent(orderId)}`, token, { method: 'DELETE' });
+      const result = await apiRequest(`/api/sales/records/${encodeURIComponent(orderId)}`, token, { method: 'DELETE' });
       setDataVersion((v) => v + 1);
       loadSalesRecords(salesPage, salesSearch);
-      setStatus(`Order ${orderId} deleted successfully`);
-      auditLog('delete_record', 'success', { order_id: orderId });
+      setStatus(result.readme_updated
+        ? `Order ${orderId} deleted successfully; README updated.`
+        : `Order ${orderId} deleted, but README update failed: ${result.readme_error || 'unknown error'}`);
+      auditLog('delete_record', result.readme_updated ? 'success' : 'error', {
+        order_id: orderId,
+        readme_error: result.readme_error,
+      });
     } catch (err) {
       setStatus(`Failed to delete order: ${err.message}`);
       auditLog('delete_record', 'error', { order_id: orderId, error: err.message });
@@ -574,8 +579,8 @@ export default function App() {
       }
 
       setSalesActionStatus({
-        type: 'success',
-        message: res.message || (isUpdate ? 'Sale updated successfully!' : 'Sale created successfully!'),
+        type: res.readme_updated ? 'success' : 'error',
+        message: `${res.message || (isUpdate ? 'Sale updated successfully!' : 'Sale created successfully!')}${res.readme_updated ? ' README updated.' : ` README update failed: ${res.readme_error || 'unknown error'}`}`,
       });
       setDataVersion((v) => v + 1);
       loadSalesRecords(0, salesSearch);
@@ -1249,14 +1254,17 @@ export default function App() {
       const importSummary = uploadMode === 'append'
         ? `Added ${formatNumber(result.added_records || 0)} records; skipped ${formatNumber(result.skipped_duplicates || 0)} duplicate order IDs.`
         : `Loaded ${formatNumber(result.records_loaded || 0)} records and replaced the active dataset.`;
+      const readmeSummary = result.readme_updated
+        ? ' README updated.'
+        : ` README update failed: ${result.readme_error || 'unknown error'}`;
       setUploadStatus({
-        type: result.db_synced ? 'success' : 'error',
-        message: `${result.db_synced ? '✅' : '⚠️'} "${result.filename}" ${importSummary}${result.db_synced ? ' Dashboard reloading…' : ` Database sync failed: ${result.db_error || 'unknown error'}`}`,
+        type: result.db_synced && result.readme_updated ? 'success' : 'error',
+        message: `${result.db_synced ? '✅' : '⚠️'} "${result.filename}" ${importSummary}${result.db_synced ? ' Dashboard reloading…' : ` Database sync failed: ${result.db_error || 'unknown error'}`}${readmeSummary}`,
       });
       setUploadFile(null);
       if (fileInputRef.current) fileInputRef.current.value = '';
       setDataVersion((v) => v + 1);
-      if (result.db_synced) setTimeout(() => {
+      if (result.db_synced && result.readme_updated) setTimeout(() => {
         setUploadStatus({ type: '', message: '' });
       }, 2800);
       auditLog('data_upload', result.db_synced ? 'success' : 'error', {
@@ -1266,6 +1274,7 @@ export default function App() {
         added_records: result.added_records,
         skipped_duplicates: result.skipped_duplicates,
         db_error: result.db_error,
+        readme_error: result.readme_error,
       });
     } catch (error) {
       setUploadStatus({
@@ -1284,15 +1293,19 @@ export default function App() {
     setUploadStatus({ type: 'info', message: `Restoring "${version.filename}"…` });
     try {
       const result = await apiRequest(`/api/data/restore/${encodeURIComponent(version.id)}`, token, { method: 'POST' });
+      const readmeSummary = result.readme_updated
+        ? ' README updated.'
+        : ` README update failed: ${result.readme_error || 'unknown error'}`;
       setUploadStatus({
-        type: result.db_synced ? 'success' : 'error',
-        message: `${result.db_synced ? '✅' : '⚠️'} Restored "${version.filename}" with ${formatNumber(result.records_loaded || 0)} records.${result.db_synced ? '' : ` Database sync failed: ${result.db_error || 'unknown error'}`}`,
+        type: result.db_synced && result.readme_updated ? 'success' : 'error',
+        message: `${result.db_synced ? '✅' : '⚠️'} Restored "${version.filename}" with ${formatNumber(result.records_loaded || 0)} records.${result.db_synced ? '' : ` Database sync failed: ${result.db_error || 'unknown error'}`}${readmeSummary}`,
       });
       setDataVersion((v) => v + 1);
-      auditLog('data_restore', result.db_synced ? 'success' : 'error', {
+      auditLog('data_restore', result.db_synced && result.readme_updated ? 'success' : 'error', {
         filename: version.filename,
         version_id: version.id,
         db_error: result.db_error,
+        readme_error: result.readme_error,
       });
     } catch (error) {
       setUploadStatus({ type: 'error', message: error.message || 'Unable to restore the saved dataset.' });

@@ -69,39 +69,280 @@ def test_admin_can_manage_filter_options() -> None:
     assert "Home Care" not in dashboard_again.json()["filters"]["categories"]
 
 
-def test_uploaded_dataset_refreshes_runtime_engine() -> None:
+def test_uploaded_dataset_refreshes_runtime_engine(tmp_path: Path, monkeypatch) -> None:
+    columns = [
+        "order_id",
+        "order_date",
+        "order_datetime",
+        "day_of_week",
+        "month",
+        "year",
+        "customer_id",
+        "customer_segment",
+        "product_category",
+        "product_name",
+        "quantity",
+        "net_amount",
+        "region",
+        "city",
+        "order_status",
+    ]
+    existing = {
+        "order_id": "existing-1",
+        "order_date": "2026-01-01",
+        "customer_id": "customer-1",
+        "customer_segment": "Regular",
+        "product_category": "Existing Category",
+        "product_name": "Existing Product",
+        "quantity": 1,
+        "net_amount": 100,
+        "region": "North",
+        "city": "Delhi",
+        "order_status": "Delivered",
+    }
+    active_dataset = tmp_path / "initial.csv"
+    source = tmp_path / "uploaded.csv"
+    main.pd.DataFrame([existing], columns=columns).to_csv(active_dataset, index=False)
+    main.pd.DataFrame(
+        [{**existing, "order_id": "imported-1", "net_amount": 200}],
+        columns=columns,
+    ).to_csv(source, index=False)
+    canonical_dataset = tmp_path / "ecommerce_sales_raw.csv.csv"
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        f"Dataset details\n{main.README_DATASET_START}\ninitial status\n{main.README_DATASET_END}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "DATASET", active_dataset)
+    monkeypatch.setattr(main, "CANONICAL_DATASET", canonical_dataset)
+    monkeypatch.setattr(main, "README_PATH", readme)
+    monkeypatch.setattr(main, "ACTIVE_DATASET_FILE", tmp_path / ".active_dataset_path.txt")
+    monkeypatch.setattr(main, "engine", main.AnalyticsEngine(active_dataset))
+    monkeypatch.setattr(main, "_archive_active_dataset", lambda: None)
+    monkeypatch.setattr(main.db_sync, "sync_csv_to_db", lambda *args, **kwargs: {})
+    monkeypatch.setenv("DATASET_PATH", str(active_dataset))
+
     token = main.token_for("admin-upload@example.com", "Admin")
 
-    source = Path("data/raw/ecommerce_sales_raw.csv.csv")
     uploaded_filename = "uploaded_ecommerce_sales_raw.csv.csv"
     response = client.post(
         "/api/data/upload",
         headers={"Authorization": f"Bearer {token}"},
         files={"file": (uploaded_filename, source.read_bytes(), "text/csv")},
+        data={"mode": "append"},
     )
 
     assert response.status_code == 200
     assert response.json()["filename"] == uploaded_filename
-    assert main.DATASET.parent == main.DATASET_UPLOADS_DIR
-    assert main.DATASET.name.endswith(uploaded_filename)
-    assert len(main.engine.frame) >= 80000
+    assert main.DATASET == canonical_dataset
+    assert main.pd.read_csv(canonical_dataset)["order_id"].tolist() == ["existing-1", "imported-1"]
+    assert len(main.engine.frame) == 2
+    assert response.json()["readme_updated"] is True
+    assert "**Records**: 2" in readme.read_text(encoding="utf-8")
+
+    replacement = {**existing, "order_id": "replacement-1", "net_amount": 400}
+    replace_response = client.post(
+        "/api/data/upload",
+        headers={"Authorization": f"Bearer {token}"},
+        files={
+            "file": (
+                "replacement.csv",
+                main.pd.DataFrame([replacement], columns=columns).to_csv(index=False).encode(),
+                "text/csv",
+            )
+        },
+        data={"mode": "replace"},
+    )
+    assert replace_response.status_code == 200
+    assert main.pd.read_csv(canonical_dataset)["order_id"].tolist() == ["replacement-1"]
+    assert replace_response.json()["readme_updated"] is True
+    assert "**Records**: 1" in readme.read_text(encoding="utf-8")
 
 
-def test_resolve_dataset_path_prefers_persisted_upload(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_dataset_path_prefers_canonical_csv(tmp_path: Path, monkeypatch) -> None:
     default_dataset = tmp_path / "default.csv"
     default_dataset.write_text("order_id\noriginal\n", encoding="utf-8")
     uploaded_dataset = tmp_path / "uploads" / "uploaded.csv"
     uploaded_dataset.parent.mkdir()
     uploaded_dataset.write_text("order_id\nimported\n", encoding="utf-8")
+    canonical_dataset = tmp_path / "ecommerce_sales_raw.csv.csv"
+    canonical_dataset.write_text("order_id\ncanonical\n", encoding="utf-8")
     active_dataset_file = tmp_path / ".active_dataset_path.txt"
     active_dataset_file.write_text(str(uploaded_dataset), encoding="utf-8")
 
+    monkeypatch.setattr(main, "CANONICAL_DATASET", canonical_dataset)
     monkeypatch.setattr(main, "ACTIVE_DATASET_FILE", active_dataset_file)
     monkeypatch.setattr(main, "LARGE_DATASET", tmp_path / "missing-large.csv")
     monkeypatch.setattr(main, "DEFAULT_DATASET", default_dataset)
     monkeypatch.setenv("DATASET_PATH", str(default_dataset))
 
-    assert main.resolve_dataset_path() == uploaded_dataset
+    assert main.resolve_dataset_path() == canonical_dataset
+
+
+def test_individual_sale_changes_persist_to_canonical_csv(tmp_path: Path, monkeypatch) -> None:
+    columns = [
+        "order_id",
+        "order_date",
+        "order_datetime",
+        "day_of_week",
+        "month",
+        "year",
+        "customer_id",
+        "customer_segment",
+        "product_category",
+        "product_name",
+        "quantity",
+        "unit_price",
+        "gross_amount",
+        "discount_pct",
+        "discount_amount",
+        "net_amount",
+        "payment_method",
+        "region",
+        "city",
+        "order_status",
+    ]
+    initial_row = {
+        "order_id": "initial-order",
+        "order_date": "2026-01-01",
+        "order_datetime": "2026-01-01 10:00:00",
+        "day_of_week": "Thursday",
+        "month": "January",
+        "year": 2026,
+        "customer_id": "customer-1",
+        "customer_segment": "Regular",
+        "product_category": "Existing",
+        "product_name": "Existing Product",
+        "quantity": 1,
+        "unit_price": 100,
+        "gross_amount": 100,
+        "discount_pct": 0,
+        "discount_amount": 0,
+        "net_amount": 100,
+        "payment_method": "Credit Card",
+        "region": "North",
+        "city": "Delhi",
+        "order_status": "Delivered",
+    }
+    canonical_dataset = tmp_path / "ecommerce_sales_raw.csv.csv"
+    main.pd.DataFrame([initial_row], columns=columns).to_csv(canonical_dataset, index=False)
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        f"Dataset details\n{main.README_DATASET_START}\ninitial status\n{main.README_DATASET_END}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "CANONICAL_DATASET", canonical_dataset)
+    monkeypatch.setattr(main, "DATASET", canonical_dataset)
+    monkeypatch.setattr(main, "README_PATH", readme)
+    monkeypatch.setattr(main, "engine", main.AnalyticsEngine(canonical_dataset))
+    monkeypatch.setattr(main.db_sync, "upsert_sale_to_db", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(main.db_sync, "delete_sale_from_db", lambda *_args, **_kwargs: None)
+
+    with canonical_dataset.open("rb+") as dataset_file:
+        dataset_file.seek(-1, 2)
+        assert dataset_file.read(1) == b"\n"
+        dataset_file.truncate(dataset_file.tell() - 1)
+
+    token = main.token_for("canonical-sales-admin@example.com", "Admin")
+    headers = {"Authorization": f"Bearer {token}"}
+    created = client.post(
+        "/api/sales/records",
+        headers=headers,
+        json={
+            "order_id": "new-order",
+            "order_date": "2026-01-02",
+            "customer_id": "customer-2",
+            "product_name": "New Product",
+            "product_category": "New Category",
+            "quantity": 2,
+            "unit_price": 50,
+            "region": "North",
+            "city": "Delhi",
+        },
+    )
+    assert created.status_code == 200
+    after_create = main.pd.read_csv(canonical_dataset)
+    assert "new-order" in after_create["order_id"].tolist()
+    assert created.json()["readme_updated"] is True
+
+    updated = client.put(
+        "/api/sales/records/new-order",
+        headers=headers,
+        json={"product_name": "Updated Product", "sales": 175},
+    )
+    assert updated.status_code == 200
+    after_update = main.pd.read_csv(canonical_dataset)
+    updated_row = after_update.loc[after_update["order_id"].eq("new-order")].iloc[0]
+    assert updated_row["product_name"] == "Updated Product"
+    assert updated_row["net_amount"] == 175
+
+    deleted = client.delete("/api/sales/records/new-order", headers=headers)
+    assert deleted.status_code == 200
+    assert "new-order" not in main.pd.read_csv(canonical_dataset)["order_id"].tolist()
+
+
+def test_restoring_version_writes_canonical_dataset_and_readme(tmp_path: Path, monkeypatch) -> None:
+    columns = [
+        "order_id",
+        "order_date",
+        "customer_id",
+        "customer_segment",
+        "product_category",
+        "product_name",
+        "quantity",
+        "net_amount",
+        "region",
+        "city",
+        "order_status",
+    ]
+    row = {
+        "order_id": "restored-1",
+        "order_date": "2026-01-01",
+        "customer_id": "customer-1",
+        "customer_segment": "Regular",
+        "product_category": "Restored Category",
+        "product_name": "Restored Product",
+        "quantity": 1,
+        "net_amount": 125,
+        "region": "North",
+        "city": "Delhi",
+        "order_status": "Delivered",
+    }
+    versions_dir = tmp_path / "versions"
+    versions_dir.mkdir()
+    version_id = "a" * 32
+    version_path = versions_dir / f"{version_id}.csv"
+    main.pd.DataFrame([row], columns=columns).to_csv(version_path, index=False)
+    active_dataset = tmp_path / "active.csv"
+    main.pd.DataFrame([{**row, "order_id": "old-1"}], columns=columns).to_csv(active_dataset, index=False)
+    canonical_dataset = tmp_path / "ecommerce_sales_raw.csv.csv"
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        f"Dataset details\n{main.README_DATASET_START}\ninitial status\n{main.README_DATASET_END}\n",
+        encoding="utf-8",
+    )
+    active_path_file = tmp_path / ".active_dataset_path.txt"
+    monkeypatch.setattr(main, "DATASET", active_dataset)
+    monkeypatch.setattr(main, "CANONICAL_DATASET", canonical_dataset)
+    monkeypatch.setattr(main, "DATASET_VERSIONS_DIR", versions_dir)
+    monkeypatch.setattr(main, "ACTIVE_DATASET_FILE", active_path_file)
+    monkeypatch.setattr(main, "README_PATH", readme)
+    monkeypatch.setattr(main, "engine", main.AnalyticsEngine(active_dataset))
+    monkeypatch.setattr(main, "_archive_active_dataset", lambda: None)
+    monkeypatch.setattr(main.db_sync, "sync_csv_to_db", lambda *args, **kwargs: {})
+
+    token = main.token_for("restore-admin@example.com", "Admin")
+    response = client.post(
+        f"/api/data/restore/{version_id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+
+    assert response.status_code == 200
+    assert main.DATASET == canonical_dataset
+    assert active_path_file.read_text(encoding="utf-8") == str(canonical_dataset)
+    assert main.pd.read_csv(canonical_dataset)["order_id"].tolist() == ["restored-1"]
+    assert response.json()["readme_updated"] is True
+    assert "**Records**: 1" in readme.read_text(encoding="utf-8")
 
 
 def test_demo_user_can_login() -> None:
@@ -227,7 +468,13 @@ def test_manager_replace_preserves_other_branches(tmp_path: Path, monkeypatch) -
         monkeypatch.setattr(main, "engine", dataset_engine)
 
     monkeypatch.setattr(main, "DATASET", active_dataset)
-    monkeypatch.setattr(main, "DATASET_UPLOADS_DIR", tmp_path / "uploads")
+    monkeypatch.setattr(main, "CANONICAL_DATASET", tmp_path / "ecommerce_sales_raw.csv.csv")
+    readme = tmp_path / "README.md"
+    readme.write_text(
+        f"Dataset details\n{main.README_DATASET_START}\ninitial status\n{main.README_DATASET_END}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(main, "README_PATH", readme)
     monkeypatch.setattr(main, "_archive_active_dataset", lambda: None)
     monkeypatch.setattr(main, "_activate_dataset", activate_dataset)
     monkeypatch.setattr(main.db_sync, "sync_csv_to_db", lambda *args, **kwargs: {})

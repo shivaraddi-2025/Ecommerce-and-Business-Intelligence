@@ -791,6 +791,14 @@ class AnalyticsEngine:
 		payment_method = str(payload.get("payment_method") or "Credit Card").strip()
 		order_status = str(payload.get("order_status") or "Delivered").strip()
 
+		with self.dataset_path.open("rb+") as dataset_file:
+			dataset_file.seek(0, 2)
+			if dataset_file.tell() > 0:
+				dataset_file.seek(-1, 2)
+				if dataset_file.read(1) not in (b"\n", b"\r"):
+					dataset_file.seek(0, 2)
+					dataset_file.write(b"\n")
+
 		if "order_id" in raw.columns:
 			new_row = {
 				"order_id": order_id,
